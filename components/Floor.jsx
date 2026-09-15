@@ -154,6 +154,53 @@ function fitView(offs, plane, stage, tilt, reserveRight) {
   return best;
 }
 
+// ---- agent mesh: beams that arc through the air between desks ----
+// The room is a 3D plane, so a link cannot be one flat line — it is a chain of
+// short segments, each translated to its own height and pitched to meet the
+// next. They foreshorten with the camera like everything else in the scene.
+const LINK_SEGS = 5;
+const LINK_BASE_Z = 34; // leaves the desk at monitor height, not off the floor
+const LINK_ARC_Z = 88; // extra lift at the midpoint — clears the desks and name signs
+
+// Parabola through both desks, peaking between them.
+const linkZ = (t) => LINK_BASE_Z + LINK_ARC_Z * 4 * t * (1 - t);
+
+// Desk slots are fixed, so a link's geometry never changes once computed.
+const linkCache = new Map();
+
+function linkSegments(from, to) {
+  const key = `${from.x},${from.y}>${to.x},${to.y}`;
+  const hit = linkCache.get(key);
+  if (hit) return hit;
+  const segs = [];
+  for (let i = 0; i < LINK_SEGS; i++) {
+    const t0 = i / LINK_SEGS;
+    const t1 = (i + 1) / LINK_SEGS;
+    const ax = from.x + (to.x - from.x) * t0;
+    const ay = from.y + (to.y - from.y) * t0;
+    const az = linkZ(t0);
+    const bz = linkZ(t1);
+    // Length along the floor vs the climb, so each segment meets the next.
+    const flat = Math.hypot(
+      from.x + (to.x - from.x) * t1 - ax,
+      from.y + (to.y - from.y) * t1 - ay,
+    );
+    const yaw = (Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI;
+    const pitch = (Math.atan2(bz - az, flat) * 180) / Math.PI;
+    segs.push({
+      len: Math.hypot(flat, bz - az),
+      // rotateZ aims the segment across the floor, rotateY tips it into the air
+      transform: `translate3d(${ax}px,${ay}px,${az}px) rotateZ(${yaw}deg) rotateY(${-pitch}deg)`,
+    });
+  }
+  linkCache.set(key, segs);
+  return segs;
+}
+
+// Mirrors isLead() in lib/skills.js: the office hub is whoever leads it, by role
+// or by name, and failing that the first agent in the room.
+const isLeadAgent = (a) => /lead|manager|architect|boss/i.test(`${a?.role || ''} ${a?.name || ''}`);
+
 const slug = (n) =>
   n.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'new';
 
@@ -241,6 +288,11 @@ export default function Floor() {
   const [pickerErr, setPickerErr] = useState('');
   const [pickerBusy, setPickerBusy] = useState(false);
   const [tasks, setTasks] = useState([]); // parsed [TASK]/[DONE]/[SUMMARY] across the floor
+  const [tickets, setTickets] = useState({ offices: [], todo: 0 }); // tracker backlog
+  // per-office tracker config, edited in the office form
+  const [trkProvider, setTrkProvider] = useState('');
+  const [trkWorkspace, setTrkWorkspace] = useState('');
+  const [trkProject, setTrkProject] = useState('');
   const termControls = useRef(null);
   const loaded = useRef(false);
 
@@ -425,6 +477,18 @@ export default function Floor() {
     return () => clearInterval(iv);
   }, []);
 
+  // The backlog the server already pulled; this never calls the tracker itself.
+  useEffect(() => {
+    const tick = () =>
+      fetch('/api/tickets')
+        .then((r) => r.json())
+        .then((d) => setTickets(d || { offices: [], todo: 0 }))
+        .catch(() => {});
+    tick();
+    const iv = setInterval(tick, 15000);
+    return () => clearInterval(iv);
+  }, []);
+
   const openMemEditor = () => {
     setMemDraft(memContent);
     setMemEditor(true);
@@ -592,6 +656,9 @@ export default function Floor() {
     setForm('office');
     setDraft('');
     setCwdDraft('');
+    setTrkProvider('');
+    setTrkWorkspace('');
+    setTrkProject('');
     setAccent(PALETTE[(offices?.length || 0) % PALETTE.length]);
   };
   const startAgent = (e) => {
@@ -601,8 +668,18 @@ export default function Floor() {
     setDraft('');
     setRole('');
   };
+  // Undefined rather than an empty object, so an office with no tracker keeps a
+  // clean state.json entry instead of a husk.
+  const trackerDraft = () =>
+    trkProvider
+      ? { provider: trkProvider, workspace: trkWorkspace.trim(), project: trkProject.trim(), enabled: true }
+      : undefined;
+
   const cancelForm = () => {
     setForm(null);
+    setTrkProvider('');
+    setTrkWorkspace('');
+    setTrkProject('');
     setDraft('');
     setRole('');
     setCwdDraft('');
@@ -617,6 +694,9 @@ export default function Floor() {
     setDraft(o.name);
     setCwdDraft(o.cwd || '');
     setEditOfficeCwd(o.cwd || '');
+    setTrkProvider(o.tracker?.provider || '');
+    setTrkWorkspace(o.tracker?.workspace || '');
+    setTrkProject(o.tracker?.project || '');
     setAccent(o.accent);
     setEditTarget({ oid: o.id });
   };
@@ -667,7 +747,16 @@ export default function Floor() {
       const id = slug(name);
       setOffices((os) => [
         ...os,
-        { id, name: name.toUpperCase(), accent, x: 0, y: 0, cwd: cwdDraft.trim(), agents: [] },
+        {
+          id,
+          name: name.toUpperCase(),
+          accent,
+          x: 0,
+          y: 0,
+          cwd: cwdDraft.trim(),
+          tracker: trackerDraft(),
+          agents: [],
+        },
       ]);
       setInside(id);
       setOpen(null);
@@ -687,7 +776,9 @@ export default function Floor() {
       // rename in place — the id (and session keys) stay stable
       setOffices((os) =>
         os.map((o) =>
-          o.id !== editTarget.oid ? o : { ...o, name: name.toUpperCase(), cwd: cwdDraft.trim(), accent }
+          o.id !== editTarget.oid
+            ? o
+            : { ...o, name: name.toUpperCase(), cwd: cwdDraft.trim(), accent, tracker: trackerDraft() }
         )
       );
     } else if (form === 'edit-agent' && editTarget) {
@@ -800,6 +891,16 @@ export default function Floor() {
   const doneCountFor = (oid, aid) =>
     tasks.filter((t) => t.kind === 'done' && t.office === oid && t.agent === aid).length;
   const recentDone = tasks.filter((t) => t.kind === 'done').slice(0, 10);
+  // Shipped work first: a [DONE] carrying a PR link is the thing to surface.
+  const recentPRs = tasks.filter((t) => t.pr).slice(0, 8);
+  const blocked = tasks.filter((t) => t.kind === 'blocked').slice(0, 5);
+  // Tracker tickets that nobody has been assigned yet.
+  const assignedKeys = new Set(tasks.filter((t) => t.kind === 'task' && t.ticket).map((t) => t.ticket));
+  const backlog = tickets.offices
+    .flatMap((o) => o.tickets.filter((t) => t.todo).map((t) => ({ ...t, officeName: o.officeName })))
+    .filter((t) => !assignedKeys.has(t.key))
+    .slice(0, 10);
+  const trackerError = tickets.offices.find((o) => o.error)?.error || null;
   const unassigned = tasks.filter((t) => t.kind === 'task' && !liveAgents.some((l) => l.office.id === t.office && l.agent.id === t.agent));
   const runningCount = liveAgents.filter((l) => l.st === 'working' || l.st === 'starting').length;
 
@@ -1355,6 +1456,78 @@ export default function Floor() {
                     backgroundSize: '38px 38px',
                   }}
                 />
+                {/* agent mesh — dotted beams arcing through the air from the office
+                    lead's desk to every worker. Each takes the colour of that
+                    worker's live status, and a pulse chases along it, so you can
+                    see which way the office is working from across the floor. */}
+                {o.agents.length > 1 &&
+                  (() => {
+                    const hubIdx = Math.max(0, o.agents.findIndex(isLeadAgent));
+                    const hub = deskSlot(hubIdx);
+                    const hubSt = statusOf(o.id, o.agents[hubIdx].id);
+                    return (
+                      <div style={{ position: 'absolute', inset: 0, transformStyle: 'preserve-3d', pointerEvents: 'none' }}>
+                        {o.agents.map((ag, i) => {
+                          if (i === hubIdx) return null;
+                          const st = statusOf(o.id, ag.id);
+                          const alive = isLive(st);
+                          const col = alive ? statusColor(st) : '#3A3A42';
+                          return (
+                            <div
+                              key={ag.id}
+                              style={{
+                                position: 'absolute',
+                                inset: 0,
+                                transformStyle: 'preserve-3d',
+                                opacity: alive ? (st === 'working' ? 1 : 0.7) : 0.3,
+                              }}
+                            >
+                              {linkSegments(hub, deskSlot(i)).map((sg, k) => (
+                                <div
+                                  key={k}
+                                  className="hf-link"
+                                  style={{
+                                    position: 'absolute',
+                                    left: 0,
+                                    top: 0,
+                                    width: sg.len,
+                                    height: st === 'working' ? 3 : 2.4,
+                                    marginTop: -1,
+                                    transformOrigin: '0 50%',
+                                    transformStyle: 'preserve-3d',
+                                    transform: sg.transform,
+                                    background: `repeating-linear-gradient(90deg, ${col} 0 4px, transparent 4px 10px)`,
+                                    borderRadius: 2,
+                                  }}
+                                />
+                              ))}
+                            </div>
+                          );
+                        })}
+                        {/* the hub itself, hovering over the lead's desk */}
+                        <div
+                          style={{
+                            position: 'absolute',
+                            left: 0,
+                            top: 0,
+                            transformStyle: 'preserve-3d',
+                            transform: `translate3d(${hub.x}px,${hub.y}px,${LINK_BASE_Z + 6}px)`,
+                          }}
+                        >
+                          <div
+                            className="hf-hub"
+                            style={{
+                              width: 10,
+                              height: 10,
+                              margin: '-5px 0 0 -5px',
+                              borderRadius: '50%',
+                              background: isLive(hubSt) ? statusColor(hubSt) : '#3A3A42',
+                            }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })()}
                 <div
                   style={{
                     position: 'absolute',
@@ -1763,6 +1936,96 @@ export default function Floor() {
                     </>
                   )}
                 </div>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 9,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#8A8A93',
+                    margin: '14px 0 6px',
+                  }}
+                >
+                  issue tracker
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {[
+                    ['', 'none'],
+                    ['plane', 'plane'],
+                    ['jira', 'jira'],
+                    ['linear', 'linear'],
+                  ].map(([id, label]) => (
+                    <span
+                      key={label}
+                      className="hf-btn"
+                      onClick={() => setTrkProvider(id)}
+                      style={{
+                        flex: 1,
+                        textAlign: 'center',
+                        ...mono,
+                        fontSize: 10,
+                        padding: '7px 0',
+                        border: `2px solid ${trkProvider === id ? '#ED1B2E' : '#2A2A2E'}`,
+                        borderRadius: 7,
+                        color: trkProvider === id ? '#F5F0E6' : '#7A7A83',
+                        cursor: 'pointer',
+                        userSelect: 'none',
+                      }}
+                    >
+                      {label}
+                    </span>
+                  ))}
+                </div>
+                {trkProvider && (
+                  <>
+                    <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                      <input
+                        className="hf-input"
+                        value={trkWorkspace}
+                        onChange={(e) => setTrkWorkspace(e.target.value)}
+                        placeholder="workspace slug"
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          boxSizing: 'border-box',
+                          background: '#0B0B0D',
+                          border: '2px solid #2A2A2E',
+                          borderRadius: 7,
+                          padding: '8px 10px',
+                          ...mono,
+                          fontSize: 10.5,
+                          color: '#F5F0E6',
+                          outline: 'none',
+                        }}
+                      />
+                      <input
+                        className="hf-input"
+                        value={trkProject}
+                        onChange={(e) => setTrkProject(e.target.value)}
+                        placeholder="project id"
+                        style={{
+                          flex: 1,
+                          minWidth: 0,
+                          boxSizing: 'border-box',
+                          background: '#0B0B0D',
+                          border: '2px solid #2A2A2E',
+                          borderRadius: 7,
+                          padding: '8px 10px',
+                          ...mono,
+                          fontSize: 10.5,
+                          color: '#F5F0E6',
+                          outline: 'none',
+                        }}
+                      />
+                    </div>
+                    <div style={{ ...mono, fontSize: 9.5, color: '#5A5A62', marginTop: 6, lineHeight: 1.5 }}>
+                      {trkProvider === 'plane'
+                        ? 'polled every ~3.5 min · needs PLANE_API_KEY in .env.local'
+                        : `${trkProvider} is not implemented yet — plane is`}
+                    </div>
+                  </>
+                )}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}>
                   <span
                     style={{
@@ -2530,7 +2793,7 @@ export default function Floor() {
             </span>
             <span style={{ flex: 1 }} />
             <span style={{ ...mono, fontSize: 9, color: runningCount ? STATUS.working : '#5A5A62' }}>
-              {runningCount} running
+              {runningCount} running{tickets.todo ? ` · ${tickets.todo} todo` : ''}
             </span>
           </div>
 
@@ -2690,6 +2953,130 @@ export default function Floor() {
                       {t.text}
                     </div>
                   </div>
+                ))}
+              </>
+            )}
+
+            {/* PRs — the thing a human most wants the moment a dev finishes */}
+            {recentPRs.length > 0 && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '12px 13px 6px',
+                    borderTop: '2px solid #1F1F23',
+                  }}
+                >
+                  pull requests · {recentPRs.length}
+                </div>
+                {recentPRs.map((t, i) => (
+                  <a
+                    key={`pr${i}`}
+                    href={t.pr}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: 'block',
+                      padding: '7px 13px',
+                      borderBottom: '1px solid #131316',
+                      borderLeft: `3px solid ${STATUS.done}`,
+                      textDecoration: 'none',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span style={{ ...mono, fontSize: 10, color: STATUS.done, flexShrink: 0 }}>⎇</span>
+                      <span style={{ ...mono, fontSize: 10, color: '#F5F0E6', flexShrink: 0 }}>
+                        {t.ticket || t.agentName}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ ...mono, fontSize: 8.5, color: '#5A5A62', flexShrink: 0 }}>
+                        {t.officeName.toLowerCase()}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 9.5,
+                        color: '#6E8BFF',
+                        marginTop: 3,
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {t.pr.replace(/^https?:\/\/(www\.)?/, '')}
+                    </div>
+                  </a>
+                ))}
+              </>
+            )}
+
+            {/* tracker backlog — tickets on the board that nobody owns yet */}
+            {(backlog.length > 0 || trackerError) && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '12px 13px 6px',
+                    borderTop: '2px solid #1F1F23',
+                  }}
+                >
+                  backlog · {backlog.length}
+                </div>
+                {trackerError && (
+                  <div style={{ ...mono, fontSize: 9.5, lineHeight: 1.5, color: '#FFC83D', padding: '0 13px 8px' }}>
+                    {trackerError}
+                  </div>
+                )}
+                {backlog.map((t) => (
+                  <a
+                    key={t.key}
+                    href={t.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ display: 'block', padding: '6px 13px', borderBottom: '1px solid #131316', textDecoration: 'none' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span
+                        style={{
+                          ...mono,
+                          fontSize: 9,
+                          color: t.priority === 'urgent' ? STATUS.offline : t.priority === 'high' ? '#FF6A1A' : '#5A5A62',
+                          flexShrink: 0,
+                        }}
+                      >
+                        ◇
+                      </span>
+                      <span style={{ ...mono, fontSize: 10, color: '#C9C9D1', flexShrink: 0 }}>{t.key}</span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ ...mono, fontSize: 8.5, color: '#5A5A62', flexShrink: 0 }}>{t.state}</span>
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 10,
+                        lineHeight: 1.5,
+                        color: '#7A7A83',
+                        marginTop: 3,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {t.title}
+                    </div>
+                  </a>
                 ))}
               </>
             )}

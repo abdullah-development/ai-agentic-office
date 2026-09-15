@@ -16,8 +16,14 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { findOffice, officeSkillsDir, resolveCwd, isLead } = require('./lib/skills.js');
+const { findOffice, officeSkillsDir, resolveCwd, isLead, readState } = require('./lib/skills.js');
 const { seedOfficeSkills } = require('./lib/seed-skills.js');
+const { loadEnv } = require('./lib/env.js');
+const { hasTracker, fetchOfficeTickets } = require('./lib/trackers/index.js');
+const { readTickets, writeTickets, newTodo, announceTickets } = require('./lib/tickets.js');
+
+// Tracker credentials live in .env.local; read them before anything else.
+loadEnv();
 
 const dev = process.env.NODE_ENV !== 'production';
 const port = parseInt(process.env.PORT || '3000', 10);
@@ -27,6 +33,10 @@ const CLAUDE_CMD = process.env.CLAUDE_CMD || 'claude';
 const AUTOSTART = process.env.AUTOSTART !== '0';
 // Claude CLI startup is heavy; stagger spawns instead of launching N at once.
 const AUTOSTART_STAGGER_MS = parseInt(process.env.AUTOSTART_STAGGER_MS || '600', 10);
+// How often each office's tracker board is pulled. TRACKER_POLL=0 disables it.
+const TRACKER_POLL_MS = parseInt(process.env.TRACKER_POLL_MS || '210000', 10); // 3.5 min
+// Whether a poll that finds new tickets may type a nudge into the lead's terminal.
+const TRACKER_NUDGE = process.env.TRACKER_NUDGE !== '0';
 
 const app = next({ dev });
 const handle = app.getRequestHandler();
@@ -364,6 +374,85 @@ function watchFloorState() {
   }
 }
 
+// ---- tracker poll: pull each office's board, put new work in front of its lead ----
+
+/** The live session for an office's lead, if it has one and it is idle. */
+function idleLeadSession(office) {
+  const lead = (office.agents || []).find(isLead);
+  if (!lead) return null;
+  const key = `${office.id}/${lead.id}`;
+  const s = sessions.get(key);
+  if (!s || s.dead) return null;
+  // Only ever interrupt an idle agent. Mid-task or mid-prompt, the nudge waits
+  // for the next poll rather than stepping on whatever is on screen.
+  if (agentState(key, s) !== 'done') return null;
+  return { key, session: s, lead };
+}
+
+function nudgeLead(office, tickets) {
+  if (!TRACKER_NUDGE) return false;
+  const found = idleLeadSession(office);
+  if (!found) return false;
+  const list = tickets.slice(0, 8).map((t) => `${t.key} ${t.title}`).join('; ');
+  const more = tickets.length > 8 ? ` (+${tickets.length - 8} more)` : '';
+  const prompt =
+    `${tickets.length} new ticket(s) landed on the office board from the tracker: ${list}${more}. ` +
+    `Use your triage-backlog skill: read the [TICKET] rows in the office memory, decide which to take now, ` +
+    `and assign each one with a [TASK] line naming the dev and the ticket key.`;
+  try {
+    // A PTY takes keystrokes; \r is the Enter that submits the prompt.
+    found.session.pty.write(`${prompt}\r`);
+    console.log(`> tracker: nudged ${found.key} with ${tickets.length} ticket(s)`);
+    return true;
+  } catch (err) {
+    console.error(`> tracker: could not nudge ${found.key}: ${err.message}`);
+    return false;
+  }
+}
+
+let polling = false;
+async function pollTrackers(reason) {
+  if (polling) return;
+  const offices = (readState().offices || []).filter(hasTracker);
+  if (!offices.length) return;
+  polling = true;
+  try {
+    for (const office of offices) {
+      const { tickets, error, provider } = await fetchOfficeTickets(office);
+      if (error) {
+        console.error(`> tracker (${office.id}/${provider}): ${error}`);
+        // Keep the last good board; only record that this attempt failed.
+        const prev = readTickets(office.id);
+        writeTickets(office.id, { ...prev, error, fetchedAt: new Date().toISOString() });
+        continue;
+      }
+      const prev = readTickets(office.id).tickets;
+      writeTickets(office.id, { provider, tickets, error: null, fetchedAt: new Date().toISOString() });
+
+      const fresh = newTodo(prev, tickets);
+      if (!fresh.length) continue;
+      const written = announceTickets(office.id, fresh);
+      if (!written.length) continue;
+      console.log(`> tracker (${office.id}): ${written.length} new ticket(s) on the board [${reason}]`);
+      nudgeLead(office, written);
+    }
+  } finally {
+    polling = false;
+  }
+}
+
+function startTrackerPolling() {
+  if (TRACKER_POLL_MS <= 0) {
+    console.log('> tracker polling disabled (TRACKER_POLL_MS=0)');
+    return;
+  }
+  const mins = (TRACKER_POLL_MS / 60000).toFixed(1);
+  console.log(`> tracker polling every ${mins} min${TRACKER_NUDGE ? '' : ' (lead nudge off)'}`);
+  // Let the floor finish booting before the first pull.
+  setTimeout(() => pollTrackers('boot'), 15000);
+  setInterval(() => pollTrackers('interval'), TRACKER_POLL_MS);
+}
+
 function sessionStatus() {
   const out = {};
   // Every agent on the floor gets an entry, even ones with no session yet.
@@ -478,6 +567,7 @@ app.prepare().then(() => {
 
   server.listen(port, () => {
     console.log(`> Harness Floor on http://localhost:${port} (claude cmd: ${CLAUDE_CMD})`);
+    startTrackerPolling();
     if (AUTOSTART) {
       startAllSessions('boot');
       watchFloorState();

@@ -1,7 +1,12 @@
 # deps / build
 node_modules/
 .next/
+.next-*/
 *.log
+
+# secrets — tracker API keys live here and must never be committed
+.env.local
+.env*.local
 
 # macOS
 .DS_Store
@@ -17,6 +22,8 @@ node_modules/
 # to `data/state.json` on first boot.
 data/state.json
 data/agent-sessions.json
+# the tracker backlog the poller caches per office
+data/tickets/
 
 # Office and floor memory are the agents' own notes about *your* projects.
 data/memory/*.md

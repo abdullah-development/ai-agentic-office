@@ -164,6 +164,64 @@ same rule now decides which memory protocol that agent's system prompt gets.
 
 Spawned sessions also get `OFFICE_SKILLS` and `OFFICE_PROJECT` in their environment.
 
+## Issue trackers — tickets in, pull requests out
+
+One office = one project = one tracker board. The server polls each wired office
+every ~3.5 min and turns new tickets into work the office can actually pick up.
+
+```
+poller (server.js)  ──►  lib/trackers/<provider>.js  ──►  data/tickets/<office>.json
+                                    │
+                                    └─►  "- [TICKET] KEY title — state · priority · url"
+                                         appended to the office memory board
+                                    └─►  nudge typed into the LEAD's terminal
+                                                   │
+       lead  ── skill: triage-backlog ──►  "- [TASK] <dev> <KEY>: ..."
+                                                   │
+       dev   ── skill: ticket-to-pr    ──►  branch → checks → push → `gh pr create`
+                                                   │
+                     "- [DONE] [office/dev] <KEY>: ... — <PR url>"
+                                                   │
+                        task rail: PULL REQUESTS · BACKLOG · COMPLETED
+```
+
+### Setup
+
+1. `cp .env.example .env.local` and fill in your key (`.env.local` is git-ignored).
+2. Open the office, hit ✎, pick a provider, and give it the **workspace slug** and
+   **project id** from the tracker's own URL.
+3. Restart the server. The office's agents get two extra skills — `triage-backlog`
+   for the lead, `ticket-to-pr` for the devs — seeded into `<project>/.claude/skills/`.
+
+### Providers
+
+| Provider | Status | Credentials |
+|---|---|---|
+| Plane | implemented | `PLANE_API_KEY`, optional `PLANE_BASE_URL` / `PLANE_APP_URL` for self-hosted |
+| Jira | interface only | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` |
+| Linear | interface only | `LINEAR_API_KEY` |
+
+All three sit behind one `fetchTickets(tracker) -> { tickets, error }` contract, so
+adding the other two is a single file each. A tracker that is down or misconfigured
+returns an error that surfaces in the rail — it never takes the floor down, and the
+last good board is kept.
+
+### What the poller will and won't do
+
+- Only tickets in a **backlog** or **unstarted** state count as todo; anything
+  already in progress or done is fetched but never announced.
+- A ticket is announced **once**. The poller re-reads the board's existing
+  `[TICKET]` keys every cycle, so it is safe to run forever.
+- The lead is nudged **only when there is something new and only while it is idle**
+  — never mid-task, and never on an empty poll. `TRACKER_NUDGE=0` turns it off.
+
+### Autonomy
+
+Dev agents are instructed to branch, commit, push and open a PR themselves, then
+report the URL to the board. That is deliberate and scoped to these agent sessions.
+They are told never to merge their own PR, never to push to the default branch, and
+never to change a ticket's status in the tracker — the lead owns that.
+
 ## Shared memory
 
 Hive-style shared memory backed by markdown files in `data/memory/`:
@@ -208,6 +266,10 @@ its session, so a recreated agent starts a fresh chat. Floor layout persists in
 - `app/api/pick-folder/route.js` — native macOS folder sheet via `osascript`
 - `app/api/fs/route.js` — the in-page folder browser fallback (`GET` lists, `POST` mkdirs)
 - `app/api/tasks/route.js` — parses every office's memory board into task rows for the right rail
+- `app/api/tickets/route.js` — serves the cached tracker backlog (never calls a tracker itself)
+- `lib/trackers/` — provider registry plus one file per tracker
+- `lib/tickets.js` — the ticket cache, the new-ticket diff, and the board announcer
+- `lib/env.js` — reads `.env.local` at boot, before Next loads anything
 - `components/Floor.jsx` — the 3D CSS floor (camera fly-in, offices, desks, forms, tabs)
 - `components/TerminalPane.jsx` — xterm.js terminal wired to the `/pty` socket
 - `app/api/state/route.js` — persists the floor layout to `data/state.json`
