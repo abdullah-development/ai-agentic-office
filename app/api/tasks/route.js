@@ -1,0 +1,131 @@
+/*
+ * The floor's task board, read out of the offices' shared memory files.
+ *
+ * `data/memory/<officeId>.md` doubles as each office's board, so the tasks are
+ * already there — this just parses them into rows the task sidebar can render:
+ *
+ *   - [TASK] <agent>: ...                          an assignment
+ *   - [TASK] <lead> -> <agent> (DISPLAY NAME): ... the arrow form leads write
+ *   - [DONE] [office/agent] <task>: ...            a completed report
+ *   - [SUMMARY] [office/agent]: ...                the lead's wrap-up
+ */
+import { promises as fs } from 'fs';
+import path from 'path';
+import { readState } from '../../../lib/skills.js';
+
+const MEMORY_DIR = path.join(process.cwd(), 'data', 'memory');
+
+const TASK_LINE = /^\s*[-*]\s*\[TASK\]\s*(.+)$/i;
+const DONE_LINE = /^\s*[-*]\s*\[DONE\]\s*(.+)$/i;
+const SUMMARY_LINE = /^\s*[-*]\s*\[SUMMARY\]\s*(.+)$/i;
+// "[office/agent]" prefix that [DONE] and [SUMMARY] entries carry
+const WHO = /^\[([^\/\]]+)\/([^\]]+)\]\s*:?\s*([\s\S]*)$/;
+// "lead -> developer (R DEV1): body" — the assignee is the right-hand side
+const ARROW = /^(\S+)\s*(?:->|→)\s*([^\s(:]+)\s*(?:\(([^)]*)\))?\s*:\s*([\s\S]+)$/;
+const COLON = /^([^:]{1,60}?)\s*:\s*([\s\S]+)$/;
+
+// Markdown is noise in a narrow sidebar; keep the words.
+function plain(text) {
+  return String(text)
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\*\*([^*]*)\*\*/g, '$1')
+    .replace(/\*([^*]*)\*/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Match a written-down agent reference to a real agent on the floor. */
+function resolveAgent(office, raw) {
+  if (!raw) return null;
+  const want = String(raw).trim().toLowerCase();
+  const agents = office.agents || [];
+  return (
+    agents.find((a) => a.id.toLowerCase() === want) ||
+    agents.find((a) => (a.name || '').toLowerCase() === want) ||
+    // "(R DEV1)" display names come through with spaces the id dropped
+    agents.find((a) => (a.name || '').toLowerCase().replace(/\s+/g, '') === want.replace(/\s+/g, '')) ||
+    null
+  );
+}
+
+function parseOffice(office, text) {
+  const rows = [];
+  const lines = String(text).split(/\r?\n/);
+
+  lines.forEach((line, i) => {
+    let m;
+    if ((m = TASK_LINE.exec(line))) {
+      const rest = m[1].trim();
+      const arrow = ARROW.exec(rest);
+      const colon = arrow ? null : COLON.exec(rest);
+      const who = arrow ? arrow[2] : colon ? colon[1] : '';
+      const body = arrow ? arrow[4] : colon ? colon[2] : rest;
+      const agent = resolveAgent(office, who) || resolveAgent(office, arrow?.[3]);
+      rows.push({
+        kind: 'task',
+        office: office.id,
+        officeName: office.name,
+        agent: agent?.id || null,
+        agentName: agent?.name || (who ? who.toUpperCase() : 'UNASSIGNED'),
+        text: plain(body),
+        line: i + 1,
+      });
+      return;
+    }
+    if ((m = DONE_LINE.exec(line))) {
+      const rest = m[1].trim();
+      const who = WHO.exec(rest);
+      const agent = who ? resolveAgent(office, who[2]) : null;
+      rows.push({
+        kind: 'done',
+        office: office.id,
+        officeName: office.name,
+        agent: agent?.id || (who ? who[2] : null),
+        agentName: agent?.name || (who ? who[2].toUpperCase() : ''),
+        text: plain(who ? who[3] : rest),
+        line: i + 1,
+      });
+      return;
+    }
+    if ((m = SUMMARY_LINE.exec(line))) {
+      const rest = m[1].trim();
+      const who = WHO.exec(rest);
+      const agent = who ? resolveAgent(office, who[2]) : null;
+      rows.push({
+        kind: 'summary',
+        office: office.id,
+        officeName: office.name,
+        agent: agent?.id || null,
+        agentName: agent?.name || (who ? who[2].toUpperCase() : ''),
+        text: plain(who ? who[3] : rest),
+        line: i + 1,
+      });
+    }
+  });
+  return rows;
+}
+
+export async function GET() {
+  const offices = readState().offices || [];
+  const all = [];
+  for (const office of offices) {
+    const file = path.join(MEMORY_DIR, `${String(office.id).replace(/[^a-z0-9_-]/gi, '')}.md`);
+    let text = '';
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch {
+      continue; // an office whose memory file does not exist yet has no board
+    }
+    all.push(...parseOffice(office, text));
+  }
+  // Newest last in the file = newest first in the sidebar.
+  all.reverse();
+  return Response.json({
+    tasks: all,
+    counts: {
+      task: all.filter((t) => t.kind === 'task').length,
+      done: all.filter((t) => t.kind === 'done').length,
+      summary: all.filter((t) => t.kind === 'summary').length,
+    },
+  });
+}

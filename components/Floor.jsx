@@ -30,6 +30,8 @@ const isLive = (st) => st === 'working' || st === 'waiting' || st === 'done' || 
 const PALETTE = ['#ED1B2E', '#FF6A1A', '#FFC83D', '#F5F0E6'];
 const TILT = 58;
 const TERM_W = 600;
+const RAIL_W = 256; // left rail: offices, skills, memory
+const TASK_W = 310; // right rail: the live task board
 
 // Roomy dynamic layout: fixed room width, height grows with agent count (unlimited agents).
 const PLANE_W = 2400;
@@ -238,6 +240,7 @@ export default function Floor() {
   const [newFolder, setNewFolder] = useState('');
   const [pickerErr, setPickerErr] = useState('');
   const [pickerBusy, setPickerBusy] = useState(false);
+  const [tasks, setTasks] = useState([]); // parsed [TASK]/[DONE]/[SUMMARY] across the floor
   const termControls = useRef(null);
   const loaded = useRef(false);
 
@@ -409,6 +412,18 @@ export default function Floor() {
       clearInterval(iv);
     };
   }, [memScope]);
+
+  // The task board lives in the offices' memory files; /api/tasks parses them.
+  useEffect(() => {
+    const tick = () =>
+      fetch('/api/tasks')
+        .then((r) => r.json())
+        .then((d) => setTasks(d.tasks || []))
+        .catch(() => {});
+    tick();
+    const iv = setInterval(tick, 4000);
+    return () => clearInterval(iv);
+  }, []);
 
   const openMemEditor = () => {
     setMemDraft(memContent);
@@ -733,9 +748,13 @@ export default function Floor() {
   const insidePos = insideOff ? officePos[offices.findIndex((o) => o.id === insideOff.id)] : null;
 
   // camera that puts the whole floor on screen at once, whatever the office count
+  // The rails are flex siblings, so `stage` is already measured without them —
+  // only the terminal still overlays the stage and needs its width reserved.
   fitRef.current = fitView(offices, layout, stage, TILT, open ? TERM_W : 0);
 
-  const shift = open ? `translate(-${TERM_W / 2 - 40}px,-56px) ` : 'translate(-158px,-72px) ';
+  // The memory/skills cards used to float over the stage's left edge; they live
+  // in the rail now, so the camera no longer has to dodge them.
+  const shift = open ? `translate(-${TERM_W / 2}px,-56px) ` : 'translate(0px,-56px) ';
   const pan = `translate(${view.x}px,${view.y}px) `;
   const camera = insidePos
     ? pan +
@@ -762,6 +781,27 @@ export default function Floor() {
       term = { off, ag, status, color: statusColor(status) };
     }
   }
+
+  // ---- right rail data: who is alive, and what the board says about them ----
+  // Blue (working) first, then yellow (needs you), then the idle-but-alive ones,
+  // so the sidebar's top is always the thing that wants attention.
+  const LIVE_ORDER = { working: 0, starting: 1, waiting: 2, done: 3 };
+  const liveAgents = [];
+  for (const o of offices) {
+    for (const a of o.agents) {
+      const st = statusOf(o.id, a.id);
+      if (isLive(st)) liveAgents.push({ office: o, agent: a, st });
+    }
+  }
+  liveAgents.sort(
+    (x, y) => (LIVE_ORDER[x.st] ?? 9) - (LIVE_ORDER[y.st] ?? 9) || x.agent.name.localeCompare(y.agent.name),
+  );
+  const openTaskFor = (oid, aid) => tasks.find((t) => t.kind === 'task' && t.office === oid && t.agent === aid);
+  const doneCountFor = (oid, aid) =>
+    tasks.filter((t) => t.kind === 'done' && t.office === oid && t.agent === aid).length;
+  const recentDone = tasks.filter((t) => t.kind === 'done').slice(0, 10);
+  const unassigned = tasks.filter((t) => t.kind === 'task' && !liveAgents.some((l) => l.office.id === t.office && l.agent.id === t.agent));
+  const runningCount = liveAgents.filter((l) => l.st === 'working' || l.st === 'starting').length;
 
   const memEntries = memContent
     .split('\n')
@@ -805,7 +845,6 @@ export default function Floor() {
     <div
       style={{
         width: '100%',
-        maxWidth: 1440,
         margin: '0 auto',
         background: '#000',
         color: '#F5F0E6',
@@ -869,16 +908,391 @@ export default function Floor() {
         </span>
       </div>
 
-      {/* stage */}
-      <div
-        style={{
-          position: 'relative',
-          height: 'calc(100dvh - 80px)',
-          minHeight: 480,
-          background: 'radial-gradient(120% 90% at 50% 30%,#131316 0%,#000 70%)',
-          overflow: 'hidden',
-        }}
-      >
+      {/* body: offices rail · stage · terminal · task rail */}
+      <div style={{ display: 'flex', height: 'calc(100dvh - 80px)', minHeight: 480 }}>
+        {/* left rail — every office, then this office's skills and shared memory */}
+        <aside
+          style={{
+            width: RAIL_W,
+            flexShrink: 0,
+            minWidth: 0,
+            borderRight: '3px solid #2A2A2E',
+            background: '#08080A',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '11px 13px',
+              borderBottom: '2px solid #1F1F23',
+            }}
+          >
+            <span
+              style={{
+                ...archivo,
+                fontWeight: 700,
+                fontSize: 9,
+                letterSpacing: '.18em',
+                textTransform: 'uppercase',
+                color: '#ED1B2E',
+              }}
+            >
+              offices
+            </span>
+            <span style={{ flex: 1 }} />
+            <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{offices.length}</span>
+          </div>
+
+          <div style={{ overflowY: 'auto', flexShrink: 0, maxHeight: '42%' }}>
+            {offices.map((o) => {
+              const here = inside === o.id;
+              const liveHere = o.agents.filter((a) => isLive(statusOf(o.id, a.id))).length;
+              return (
+                <div
+                  key={o.id}
+                  className="hf-btn"
+                  onClick={() => enter(o.id)}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 9,
+                    padding: '9px 13px',
+                    cursor: 'pointer',
+                    borderBottom: '1px solid #131316',
+                    borderLeft: `3px solid ${here ? o.accent : 'transparent'}`,
+                    background: here ? '#101014' : 'transparent',
+                  }}
+                >
+                  <span
+                    style={{ width: 9, height: 9, borderRadius: 2, background: o.accent, flexShrink: 0 }}
+                  />
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      style={{
+                        ...bebas,
+                        fontSize: 16,
+                        lineHeight: 1.1,
+                        letterSpacing: '.03em',
+                        color: here ? '#F5F0E6' : '#C9C9D1',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {o.name}
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 9,
+                        color: o.cwd ? '#5A5A62' : '#7A5A2E',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {o.agents.length} agents
+                      {o.cwd ? ` · ${o.cwd.split('/').pop()}` : ' · no project'}
+                    </div>
+                  </div>
+                  {liveHere > 0 && (
+                    <span style={{ ...mono, fontSize: 9, color: STATUS.done, flexShrink: 0 }}>{liveHere}●</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {/* the office's own cards, below the list */}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflowY: 'auto',
+              padding: 11,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+              borderTop: '2px solid #1F1F23',
+            }}
+          >
+            {/* office skills — <project>/.claude/skills, what this office's agents know how to do */}
+            {insideOff && (
+              <div
+                style={{
+                  width: '100%',
+                  padding: '11px 13px',
+                  background: '#08080A',
+                  border: '2px solid #2A2A2E',
+                  borderRadius: 10,
+                  boxSizing: 'border-box',
+                  boxShadow: '0 12px 34px rgba(0,0,0,.6)',
+                  zIndex: 4,
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <span style={{ width: 9, height: 9, borderRadius: 2, background: insideOff.accent }} />
+                  <span
+                    style={{
+                      ...archivo,
+                      fontWeight: 700,
+                      fontSize: 9,
+                      letterSpacing: '.18em',
+                      textTransform: 'uppercase',
+                      color: '#ED1B2E',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    office skills
+                  </span>
+                  <span style={{ flex: 1 }} />
+                  <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{skills.skills.length}</span>
+                  {skills.configured && (
+                    <span
+                      className="hf-btn"
+                      onClick={startSkill}
+                      style={{
+                        ...mono,
+                        fontSize: 10,
+                        lineHeight: 1,
+                        padding: '3px 7px',
+                        border: '2px solid #2A2A2E',
+                        borderRadius: 5,
+                        color: '#8A8A93',
+                        cursor: 'pointer',
+                        userSelect: 'none',
+                      }}
+                    >
+                      +
+                    </span>
+                  )}
+                </div>
+
+                {!skills.configured && (
+                  <>
+                    <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#FFC83D' }}>
+                      no project folder — this office has nowhere to keep skills
+                    </div>
+                    <span
+                      className="hf-btn"
+                      onClick={(e) => startEditOffice(insideOff, e)}
+                      style={{
+                        display: 'inline-block',
+                        marginTop: 9,
+                        ...archivo,
+                        fontWeight: 700,
+                        fontSize: 9,
+                        letterSpacing: '.12em',
+                        textTransform: 'uppercase',
+                        padding: '7px 10px',
+                        border: '2px solid #2A2A2E',
+                        borderRadius: 7,
+                        color: '#9A9AA3',
+                        cursor: 'pointer',
+                        userSelect: 'none',
+                      }}
+                    >
+                      set project folder
+                    </span>
+                  </>
+                )}
+
+                {skills.configured && skills.skills.length === 0 && (
+                  <>
+                    <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#5A5A62' }}>
+                      none yet — seed the lead / worker starters, or write your own
+                    </div>
+                    <span
+                      className="hf-btn"
+                      onClick={seedSkills}
+                      style={{
+                        display: 'inline-block',
+                        marginTop: 9,
+                        ...archivo,
+                        fontWeight: 700,
+                        fontSize: 9,
+                        letterSpacing: '.12em',
+                        textTransform: 'uppercase',
+                        padding: '7px 10px',
+                        border: '2px solid #2A2A2E',
+                        borderRadius: 7,
+                        color: '#9A9AA3',
+                        cursor: 'pointer',
+                        userSelect: 'none',
+                      }}
+                    >
+                      seed starter skills
+                    </span>
+                  </>
+                )}
+
+                {skills.skills.slice(0, 6).map((sk) => (
+                  <div
+                    key={sk.id}
+                    className="hf-btn"
+                    onClick={() => openSkill(sk.id)}
+                    style={{ cursor: 'pointer', padding: '4px 0', borderBottom: '1px solid #131316' }}
+                  >
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 10.5,
+                        color: '#C9C9D1',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      /{sk.id}
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 9.5,
+                        lineHeight: 1.5,
+                        color: '#5A5A62',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {sk.description || 'no description'}
+                    </div>
+                  </div>
+                ))}
+                {skills.skills.length > 6 && (
+                  <div style={{ ...mono, fontSize: 9, color: '#5A5A62', marginTop: 5 }}>
+                    +{skills.skills.length - 6} more in .claude/skills
+                  </div>
+                )}
+
+                {skillErr && <div style={{ ...mono, fontSize: 10, color: '#ED1B2E', marginTop: 7 }}>{skillErr}</div>}
+
+                <div
+                  style={{
+                    ...mono,
+                    fontSize: 9,
+                    letterSpacing: '.05em',
+                    color: '#5A5A62',
+                    marginTop: 8,
+                    borderTop: '2px solid #1F1F23',
+                    paddingTop: 7,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {skills.configured ? `${skills.folder}/.claude/skills` : 'one office = one project'}
+                </div>
+              </div>
+            )}
+
+            {/* shared memory card — office memory when inside, floor memory in top view */}
+            <div
+              style={{
+                width: '100%',
+                padding: '11px 13px',
+                background: '#08080A',
+                border: '2px solid #2A2A2E',
+                borderRadius: 10,
+                boxSizing: 'border-box',
+                boxShadow: '0 12px 34px rgba(0,0,0,.6)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <span
+                  style={{ width: 9, height: 9, borderRadius: 2, background: insideOff ? insideOff.accent : '#F5F0E6' }}
+                />
+                <span
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 9,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#ED1B2E',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {insideOff ? 'shared memory' : 'floor memory'}
+                </span>
+                <span style={{ flex: 1 }} />
+                <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{memEntries.length}</span>
+                <span
+                  className="hf-btn"
+                  onClick={openMemEditor}
+                  style={{
+                    ...mono,
+                    fontSize: 10,
+                    lineHeight: 1,
+                    padding: '3px 7px',
+                    border: '2px solid #2A2A2E',
+                    borderRadius: 5,
+                    color: '#8A8A93',
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                >
+                  ✎
+                </span>
+              </div>
+              {memTail.length === 0 && (
+                <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#5A5A62' }}>
+                  empty — agents append here as they work
+                </div>
+              )}
+              {memTail.map((m, i) => (
+                <div
+                  key={i}
+                  style={{
+                    ...mono,
+                    fontSize: 10.5,
+                    lineHeight: 1.65,
+                    color: '#9A9AA3',
+                    overflowWrap: 'anywhere',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }}
+                >
+                  {m}
+                </div>
+              ))}
+              <div
+                style={{
+                  ...mono,
+                  fontSize: 9,
+                  letterSpacing: '.05em',
+                  color: '#5A5A62',
+                  marginTop: 8,
+                  borderTop: '2px solid #1F1F23',
+                  paddingTop: 7,
+                }}
+              >
+                {insideOff
+                  ? `readable by all ${insideOff.agents.length} agents in ${insideOff.name.toLowerCase()}`
+                  : 'readable by every agent in every office'}
+              </div>
+            </div>
+
+          </div>
+        </aside>
+
+        {/* stage */}
+        <div
+          style={{
+            position: 'relative',
+            flex: 1,
+            minWidth: 0,
+            height: '100%',
+            background: 'radial-gradient(120% 90% at 50% 30%,#131316 0%,#000 70%)',
+            overflow: 'hidden',
+          }}
+        >
         <div
           ref={setStageEl}
           onPointerDown={onPointerDown}
@@ -1798,269 +2212,6 @@ export default function Floor() {
           </div>
         )}
 
-        {/* shared memory card — office memory when inside, floor memory in top view */}
-        <div
-          style={{
-            position: 'absolute',
-            left: 20,
-            bottom: 58,
-            width: 290,
-            padding: '11px 13px',
-            background: '#08080A',
-            border: '2px solid #2A2A2E',
-            borderRadius: 10,
-            boxSizing: 'border-box',
-            boxShadow: '0 12px 34px rgba(0,0,0,.6)',
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <span
-              style={{ width: 9, height: 9, borderRadius: 2, background: insideOff ? insideOff.accent : '#F5F0E6' }}
-            />
-            <span
-              style={{
-                ...archivo,
-                fontWeight: 700,
-                fontSize: 9,
-                letterSpacing: '.18em',
-                textTransform: 'uppercase',
-                color: '#ED1B2E',
-              }}
-            >
-              {insideOff ? 'shared memory' : 'floor memory'}
-            </span>
-            <span style={{ flex: 1 }} />
-            <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{memEntries.length} entries</span>
-            <span
-              className="hf-btn"
-              onClick={openMemEditor}
-              style={{
-                ...mono,
-                fontSize: 10,
-                lineHeight: 1,
-                padding: '3px 7px',
-                border: '2px solid #2A2A2E',
-                borderRadius: 5,
-                color: '#8A8A93',
-                cursor: 'pointer',
-                userSelect: 'none',
-              }}
-            >
-              ✎
-            </span>
-          </div>
-          {memTail.length === 0 && (
-            <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#5A5A62' }}>
-              empty — agents append here as they work
-            </div>
-          )}
-          {memTail.map((m, i) => (
-            <div
-              key={i}
-              style={{
-                ...mono,
-                fontSize: 10.5,
-                lineHeight: 1.65,
-                color: '#9A9AA3',
-                overflowWrap: 'anywhere',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {m}
-            </div>
-          ))}
-          <div
-            style={{
-              ...mono,
-              fontSize: 9,
-              letterSpacing: '.05em',
-              color: '#5A5A62',
-              marginTop: 8,
-              borderTop: '2px solid #1F1F23',
-              paddingTop: 7,
-            }}
-          >
-            {insideOff
-              ? `readable by all ${insideOff.agents.length} agents in ${insideOff.name.toLowerCase()}`
-              : 'readable by every agent in every office'}
-          </div>
-        </div>
-
-        {/* office skills — <project>/.claude/skills, what this office's agents know how to do */}
-        {insideOff && (
-          <div
-            style={{
-              position: 'absolute',
-              left: 20,
-              top: 18,
-              width: 290,
-              padding: '11px 13px',
-              background: '#08080A',
-              border: '2px solid #2A2A2E',
-              borderRadius: 10,
-              boxSizing: 'border-box',
-              boxShadow: '0 12px 34px rgba(0,0,0,.6)',
-              zIndex: 4,
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              <span style={{ width: 9, height: 9, borderRadius: 2, background: insideOff.accent }} />
-              <span
-                style={{
-                  ...archivo,
-                  fontWeight: 700,
-                  fontSize: 9,
-                  letterSpacing: '.18em',
-                  textTransform: 'uppercase',
-                  color: '#ED1B2E',
-                }}
-              >
-                office skills
-              </span>
-              <span style={{ flex: 1 }} />
-              <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{skills.skills.length}</span>
-              {skills.configured && (
-                <span
-                  className="hf-btn"
-                  onClick={startSkill}
-                  style={{
-                    ...mono,
-                    fontSize: 10,
-                    lineHeight: 1,
-                    padding: '3px 7px',
-                    border: '2px solid #2A2A2E',
-                    borderRadius: 5,
-                    color: '#8A8A93',
-                    cursor: 'pointer',
-                    userSelect: 'none',
-                  }}
-                >
-                  +
-                </span>
-              )}
-            </div>
-
-            {!skills.configured && (
-              <>
-                <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#FFC83D' }}>
-                  no project folder — this office has nowhere to keep skills
-                </div>
-                <span
-                  className="hf-btn"
-                  onClick={(e) => startEditOffice(insideOff, e)}
-                  style={{
-                    display: 'inline-block',
-                    marginTop: 9,
-                    ...archivo,
-                    fontWeight: 700,
-                    fontSize: 9,
-                    letterSpacing: '.12em',
-                    textTransform: 'uppercase',
-                    padding: '7px 10px',
-                    border: '2px solid #2A2A2E',
-                    borderRadius: 7,
-                    color: '#9A9AA3',
-                    cursor: 'pointer',
-                    userSelect: 'none',
-                  }}
-                >
-                  set project folder
-                </span>
-              </>
-            )}
-
-            {skills.configured && skills.skills.length === 0 && (
-              <>
-                <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.65, color: '#5A5A62' }}>
-                  none yet — seed the lead / worker starters, or write your own
-                </div>
-                <span
-                  className="hf-btn"
-                  onClick={seedSkills}
-                  style={{
-                    display: 'inline-block',
-                    marginTop: 9,
-                    ...archivo,
-                    fontWeight: 700,
-                    fontSize: 9,
-                    letterSpacing: '.12em',
-                    textTransform: 'uppercase',
-                    padding: '7px 10px',
-                    border: '2px solid #2A2A2E',
-                    borderRadius: 7,
-                    color: '#9A9AA3',
-                    cursor: 'pointer',
-                    userSelect: 'none',
-                  }}
-                >
-                  seed starter skills
-                </span>
-              </>
-            )}
-
-            {skills.skills.slice(0, 6).map((sk) => (
-              <div
-                key={sk.id}
-                className="hf-btn"
-                onClick={() => openSkill(sk.id)}
-                style={{ cursor: 'pointer', padding: '4px 0', borderBottom: '1px solid #131316' }}
-              >
-                <div
-                  style={{
-                    ...mono,
-                    fontSize: 10.5,
-                    color: '#C9C9D1',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  /{sk.id}
-                </div>
-                <div
-                  style={{
-                    ...mono,
-                    fontSize: 9.5,
-                    lineHeight: 1.5,
-                    color: '#5A5A62',
-                    whiteSpace: 'nowrap',
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  }}
-                >
-                  {sk.description || 'no description'}
-                </div>
-              </div>
-            ))}
-            {skills.skills.length > 6 && (
-              <div style={{ ...mono, fontSize: 9, color: '#5A5A62', marginTop: 5 }}>
-                +{skills.skills.length - 6} more in .claude/skills
-              </div>
-            )}
-
-            {skillErr && <div style={{ ...mono, fontSize: 10, color: '#ED1B2E', marginTop: 7 }}>{skillErr}</div>}
-
-            <div
-              style={{
-                ...mono,
-                fontSize: 9,
-                letterSpacing: '.05em',
-                color: '#5A5A62',
-                marginTop: 8,
-                borderTop: '2px solid #1F1F23',
-                paddingTop: 7,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {skills.configured ? `${skills.folder}/.claude/skills` : 'one office = one project'}
-            </div>
-          </div>
-        )}
-
         {/* skill editor */}
         {skillEditor && (
           <div
@@ -2199,46 +2350,6 @@ export default function Floor() {
             </div>
           </div>
         )}
-
-        {/* office tabs */}
-        <div
-          style={{
-            position: 'absolute',
-            left: 20,
-            bottom: 18,
-            display: 'flex',
-            gap: 8,
-            alignItems: 'center',
-            maxWidth: `calc(100% - ${(term ? TERM_W : 0) + 320}px)`,
-            overflowX: 'auto',
-            paddingBottom: 2,
-          }}
-        >
-          {offices.map((o) => (
-            <span
-              key={o.id}
-              onClick={() => enter(o.id)}
-              style={{
-                ...archivo,
-                fontWeight: 600,
-                fontSize: 10.5,
-                letterSpacing: '.14em',
-                textTransform: 'uppercase',
-                padding: '8px 13px',
-                borderRadius: 8,
-                cursor: 'pointer',
-                userSelect: 'none',
-                border: `2px solid ${inside === o.id ? o.accent : '#2A2A2E'}`,
-                background: inside === o.id ? o.accent : 'transparent',
-                color: inside === o.id ? '#000' : '#9A9AA3',
-                flexShrink: 0,
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {o.name}
-            </span>
-          ))}
-        </div>
 
         {/* camera controls */}
         <div
@@ -2382,6 +2493,278 @@ export default function Floor() {
             </div>
           </div>
         )}
+        </div>
+
+        {/* right rail — the live task board: who is running, on what, and what landed */}
+        <aside
+          style={{
+            width: TASK_W,
+            flexShrink: 0,
+            minWidth: 0,
+            borderLeft: '3px solid #2A2A2E',
+            background: '#08080A',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '11px 13px',
+              borderBottom: '2px solid #1F1F23',
+            }}
+          >
+            <span
+              style={{
+                ...archivo,
+                fontWeight: 700,
+                fontSize: 9,
+                letterSpacing: '.18em',
+                textTransform: 'uppercase',
+                color: '#ED1B2E',
+              }}
+            >
+              task board
+            </span>
+            <span style={{ flex: 1 }} />
+            <span style={{ ...mono, fontSize: 9, color: runningCount ? STATUS.working : '#5A5A62' }}>
+              {runningCount} running
+            </span>
+          </div>
+
+          <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+            {/* live agents, each with whatever the board has assigned to them */}
+            <div
+              style={{
+                ...archivo,
+                fontWeight: 700,
+                fontSize: 8.5,
+                letterSpacing: '.18em',
+                textTransform: 'uppercase',
+                color: '#5A5A62',
+                padding: '10px 13px 6px',
+              }}
+            >
+              agents · {liveAgents.length} live
+            </div>
+            {liveAgents.length === 0 && (
+              <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.6, color: '#5A5A62', padding: '0 13px 10px' }}>
+                no sessions running — open an agent to start one
+              </div>
+            )}
+            {liveAgents.map(({ office: o, agent: a, st }) => {
+              const task = openTaskFor(o.id, a.id);
+              const done = doneCountFor(o.id, a.id);
+              const isOpen = open === `${o.id}/${a.id}`;
+              return (
+                <div
+                  key={`${o.id}/${a.id}`}
+                  className="hf-btn"
+                  onClick={(e) => openAgent(o.id, a.id, e)}
+                  style={{
+                    padding: '8px 13px',
+                    cursor: 'pointer',
+                    borderBottom: '1px solid #131316',
+                    borderLeft: `3px solid ${isOpen ? statusColor(st) : 'transparent'}`,
+                    background: isOpen ? '#101014' : 'transparent',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                    <span
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: '50%',
+                        background: statusColor(st),
+                        flexShrink: 0,
+                        boxShadow: st === 'working' ? `0 0 7px ${statusColor(st)}` : 'none',
+                      }}
+                    />
+                    <span
+                      style={{
+                        ...bebas,
+                        fontSize: 15,
+                        lineHeight: 1.1,
+                        letterSpacing: '.03em',
+                        color: '#F5F0E6',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {a.name}
+                    </span>
+                    <span style={{ flex: 1 }} />
+                    <span
+                      style={{
+                        ...mono,
+                        fontSize: 8.5,
+                        letterSpacing: '.06em',
+                        color: statusColor(st),
+                        flexShrink: 0,
+                        textTransform: 'uppercase',
+                      }}
+                    >
+                      {STATUS_LABEL[st] || st}
+                    </span>
+                  </div>
+                  <div
+                    style={{
+                      ...mono,
+                      fontSize: 9,
+                      color: '#5A5A62',
+                      marginTop: 2,
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {o.name.toLowerCase()}
+                    {done > 0 ? ` · ${done} done` : ''}
+                  </div>
+                  {task && (
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 10,
+                        lineHeight: 1.5,
+                        color: '#9A9AA3',
+                        marginTop: 5,
+                        paddingLeft: 7,
+                        borderLeft: `2px solid ${statusColor(st)}55`,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 3,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {task.text}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {/* assignments whose agent has no session running right now */}
+            {unassigned.length > 0 && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '12px 13px 6px',
+                    borderTop: '2px solid #1F1F23',
+                  }}
+                >
+                  queued · {unassigned.length}
+                </div>
+                {unassigned.slice(0, 6).map((t, i) => (
+                  <div key={`q${i}`} style={{ padding: '6px 13px', borderBottom: '1px solid #131316' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span
+                        style={{ width: 8, height: 8, borderRadius: '50%', background: STATUS.offline, flexShrink: 0 }}
+                      />
+                      <span style={{ ...mono, fontSize: 10, color: '#C9C9D1' }}>{t.agentName}</span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ ...mono, fontSize: 8.5, color: '#5A5A62' }}>{t.officeName.toLowerCase()}</span>
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 10,
+                        lineHeight: 1.5,
+                        color: '#7A7A83',
+                        marginTop: 3,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {t.text}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+
+            {/* what has actually landed */}
+            {recentDone.length > 0 && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '12px 13px 6px',
+                    borderTop: '2px solid #1F1F23',
+                  }}
+                >
+                  completed · {recentDone.length}
+                </div>
+                {recentDone.map((t, i) => (
+                  <div key={`d${i}`} style={{ padding: '6px 13px', borderBottom: '1px solid #131316' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                      <span style={{ ...mono, fontSize: 10, color: STATUS.done, flexShrink: 0 }}>✓</span>
+                      <span
+                        style={{
+                          ...mono,
+                          fontSize: 10,
+                          color: '#C9C9D1',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {t.agentName}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      <span style={{ ...mono, fontSize: 8.5, color: '#5A5A62', flexShrink: 0 }}>
+                        {t.officeName.toLowerCase()}
+                      </span>
+                    </div>
+                    <div
+                      style={{
+                        ...mono,
+                        fontSize: 10,
+                        lineHeight: 1.5,
+                        color: '#7A7A83',
+                        marginTop: 3,
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {t.text}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+
+          <div
+            style={{
+              ...mono,
+              fontSize: 9,
+              color: '#5A5A62',
+              padding: '8px 13px',
+              borderTop: '2px solid #1F1F23',
+            }}
+          >
+            from each office's memory board
+          </div>
+        </aside>
       </div>
     </div>
   );

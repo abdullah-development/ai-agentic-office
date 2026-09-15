@@ -75,6 +75,39 @@ the sweep on demand (useful after killing a session), and `AUTOSTART=0` disables
 | Desk light / status | Live: orange = session running, grey = not started, yellow = exited |
 | Shared memory card | Office info: cwd, agent count, live session count |
 
+## Layout — two rails around the floor
+
+```
+┌────────────┬──────────────────────────────┬──────────────┐
+│  OFFICES   │                              │  TASK BOARD  │
+│  ────────  │            3D floor          │  ──────────  │
+│  skills    │      (drag / zoom / fly in)  │  agents·live │
+│  memory    │                              │  queued      │
+│            │                              │  completed   │
+└────────────┴──────────────────────────────┴──────────────┘
+```
+
+**Left rail** — every office with its agent count, project folder, and a live-session
+count; click to fly in. Below it, the current office's skills card and the shared
+memory card (floor memory in top view). This replaces the old bottom tab strip and
+the cards that used to float over the floor.
+
+**Right rail** — the live task board, polled every 4s:
+
+| Section | Shows |
+|---|---|
+| `agents · N live` | every agent with a running session, sorted working → needs you → idle, each with its status dot, the office it's in, its `done` count, and the `[TASK]` text assigned to it |
+| `queued · N` | `[TASK]` entries whose agent has no session running |
+| `completed · N` | recent `[DONE]` reports across the whole floor |
+
+Colours are the same ones the desk lights use — blue working, yellow needs you,
+green done, red not running — so a glance at the rail and a glance at the floor
+agree. Clicking an agent row opens its terminal.
+
+The board is parsed from the offices' own memory files by `/api/tasks`; it reads
+both `[TASK] <agent>: …` and the arrow form leads tend to write,
+`[TASK] <lead> -> <agent> (DISPLAY NAME): …`.
+
 ## Status colours
 
 The dot on each agent's name tag (and the desk light) shows what that agent is doing, polled
@@ -174,6 +207,7 @@ its session, so a recreated agent starts a fresh chat. Floor layout persists in
 - `app/api/skills/route.js` — list/read/write/delete/seed an office's skills
 - `app/api/pick-folder/route.js` — native macOS folder sheet via `osascript`
 - `app/api/fs/route.js` — the in-page folder browser fallback (`GET` lists, `POST` mkdirs)
+- `app/api/tasks/route.js` — parses every office's memory board into task rows for the right rail
 - `components/Floor.jsx` — the 3D CSS floor (camera fly-in, offices, desks, forms, tabs)
 - `components/TerminalPane.jsx` — xterm.js terminal wired to the `/pty` socket
 - `app/api/state/route.js` — persists the floor layout to `data/state.json`
