@@ -1,0 +1,23 @@
+# deps / build
+node_modules/
+.next/
+*.log
+
+# macOS
+.DS_Store
+
+# Claude Code scratch
+.claude/.cc-writes/
+
+# ---- per-machine floor state ----
+# A floor is personal: which offices exist, which project folder each one owns,
+# which agents sit in it, and the Claude session UUIDs backing their terminals.
+# None of that travels — clone, run, and build your own floor in the UI.
+# `data/state.example.json` is the committed starting point; the server copies it
+# to `data/state.json` on first boot.
+data/state.json
+data/agent-sessions.json
+
+# Office and floor memory are the agents' own notes about *your* projects.
+data/memory/*.md
+!data/memory/README.md

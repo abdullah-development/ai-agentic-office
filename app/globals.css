@@ -1,0 +1,23 @@
+body {
+  margin: 0;
+  background: #000;
+  color: #f5f0e6;
+}
+a { color: #ed1b2e; }
+a:hover { color: #ff3b47; }
+
+.hf-btn:hover { border-color: #ed1b2e !important; color: #ed1b2e !important; }
+.hf-exit:hover { background: #ed1b2e; color: #000 !important; }
+.hf-add:hover { border-color: #ed1b2e !important; color: #ed1b2e !important; }
+.hf-sign:hover { filter: drop-shadow(0 0 10px rgba(237, 27, 46, 0.55)); }
+.hf-close:hover { color: #ed1b2e !important; }
+.hf-primary:hover { background: #ff3b47 !important; border-color: #ff3b47 !important; }
+.hf-ghost:hover { border-color: #3a3a40 !important; color: #f5f0e6 !important; }
+.hf-input:focus { border-color: #ed1b2e !important; }
+
+.hf-term .xterm { height: 100%; }
+.hf-term .xterm-viewport { background: transparent !important; }
+
+/* agent status dot: blue pulses while working, yellow blinks when it needs you */
+@keyframes hf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes hf-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: .2; } }

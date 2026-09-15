@@ -1,0 +1,16 @@
+{
+  "offices": [
+    {
+      "id": "my-project",
+      "name": "MY PROJECT",
+      "accent": "#ED1B2E",
+      "x": 0,
+      "y": 0,
+      "cwd": "",
+      "agents": [
+        { "id": "lead", "name": "LEAD", "role": "lead" },
+        { "id": "dev", "name": "DEV", "role": "developer" }
+      ]
+    }
+  ]
+}
