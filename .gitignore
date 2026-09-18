@@ -28,3 +28,11 @@ data/tickets/
 # Office and floor memory are the agents' own notes about *your* projects.
 data/memory/*.md
 !data/memory/README.md
+
+# ---- the floor layer ----
+# Agent mailboxes, the task ledger, the event feed, the live fleet snapshot, and
+# the per-agent settings files that carry the lifecycle hooks. All per-machine and
+# all rebuilt at boot from data/state.json — and the mail is the agents' own.
+data/floor/
+# the running server's claim on the floor (see test/floor.js)
+data/.floor.pid

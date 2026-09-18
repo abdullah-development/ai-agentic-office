@@ -229,11 +229,11 @@ Hive-style shared memory backed by markdown files in `data/memory/`:
 - `data/memory/<officeId>.md` — office memory, shared by every agent in that office
 - `data/memory/floor.md` — floor memory, shared across ALL offices
 
-The office memory file doubles as the team's task board. Agents whose role matches
-lead/manager/architect/boss get the LEAD protocol: delegate with `- [TASK] <agent>: ...`,
-review workers' `[DONE]` reports, then write `- [SUMMARY] ...`. Everyone else gets the
-WORKER protocol: check for `[TASK]` entries assigned to them, and always report back with
-`- [DONE] [office/agent] <task>: ...` when finished — a task isn't done until it's written.
+The office memory file is the office's narrative record and the board the human reads.
+It is no longer how work is *delivered* — that is the mailbox below. Agents whose role
+matches lead/manager/architect/boss get the LEAD protocol; everyone else gets the WORKER
+protocol and still reports back with `- [DONE] [office/agent] <task>: ...`, because that
+is what the task rail parses.
 
 Every spawned session gets the memory protocol injected via `--append-system-prompt`
 (read both files at task start, append durable facts, never rewrite others' entries,
@@ -242,6 +242,105 @@ prefix with `[office/agent]`) plus `--add-dir` access to the memory folder, and 
 card shows the live tail (office memory when inside, floor memory in top view; polled
 every 4s) and its ✎ opens an editor. Note: a custom `CLAUDE_CMD` is run as-is, without
 the injection.
+
+## The floor layer — mailbox, ledger, fleet, hooks
+
+Agents talk to each other. Everything lives under `data/floor/` (per-machine,
+gitignored, rebuilt at boot from `data/state.json`):
+
+```
+data/floor/
+  PROTOCOL.md                      the agent-facing contract, regenerated every boot
+  tasks.json                       the structured ledger: todo / doing / blocked / done
+  fleet.json                       live per-agent tokens, cost, breaker, backlog (every 5s)
+  log.jsonl                        append-only event feed
+  cursors.json                     server-owned: who has been woken about which mail
+  hooks.sock                       the hook plane's unix socket
+  agents/<office>__<agent>/
+    memory.md                      private long-term memory — this agent's alone
+    settings.json                  generated; carries the lifecycle hooks
+    inbox/  inbox/.done/           mail in, and mail already handled
+    outbox/ outbox/.sent/          mail out — the router drains it
+```
+
+### Messaging
+
+An agent writes ONE JSON file into its own `outbox/`. The router (`lib/mailbox.js`)
+fills in `id` / `from` / `hops` / timestamps — an agent cannot forge those — resolves
+the recipient, and writes it atomically into that inbox. **No agent ever writes into
+another agent's folder**, which is what keeps every file single-writer.
+
+Address with a bare `<agent-id>` inside your own office, `<office>/<agent-id>` across
+offices, `lead`, `floor` (every lead), or `human` (reaches the human via your lead).
+
+Four loop guards, all in the router from day one, because a mailbox without them
+burns tokens all night:
+
+1. `inform` and `done` are **terminal** — replying to one is a protocol violation.
+   Only `request` / `query` / `propose` obligate a reply.
+2. Every reply increments `hops`; past `FLOOR_HOP_CAP` (12) the message is dropped,
+   logged, and the sender told once.
+3. Handled mail moves to `inbox/.done/`; re-seeing an id is a no-op.
+4. An unknown recipient **bounces** back to the sender. Mail never vanishes silently.
+
+### Waking an agent
+
+Delivery is queued, never forced. An agent with unread **mail** is nudged through its
+terminal **only once it is idle** (`agentState() !== 'done'` gates it), so a nudge that
+lands mid-task is deferred, not dropped. Tracker tickets are deliberately excluded:
+they become ledger cards and `[TICKET]` rows, and the lead picks them up when it next
+looks. Nothing from a tracker types into a terminal. Separately, `SessionStart` and
+`UserPromptSubmit` hooks add the pending-message list to a turn that is *already*
+happening — free, and it cannot wake a sleeping agent. Nothing ever forces a turn.
+
+### The hook plane
+
+Each agent is spawned with `--settings <its own settings.json>`, which points every
+Claude Code lifecycle event at `bin/floor-hook.cjs`. The shim pipes the event to
+`data/floor/hooks.sock` and writes the server's reply to stdout — that is how a hook
+returns a decision. It **fails open** on every path: no socket, dead server, or slow
+reply all end in `exit(0)` with empty stdout.
+
+That buys exact telemetry (the real context-window size and session cost, not a guess
+from scraping the screen), per-tool events for the breaker, and the ride-along above.
+The status line also renders in the agent's own terminal as `ctx 45k/200k (23%)`.
+
+### Circuit breaker
+
+Watches for the same tool with the same arguments repeating, consecutive failures, and
+spend. It escalates `steer` → `constrain` → `stop`, telling the agent **through its own
+inbox** — the place it already reads. Only `stop` takes the decision away, by denying at
+`PreToolUse`. Click a tripped agent's breaker chip in the right rail to clear it.
+
+### ASK ME
+
+When a card can only move with you, the lead sets it `blocked` and appends the ask to
+its `humanQA` array. The ask appears at the top of the right rail with an answer box
+(⌘⏎ sends); your answer lands in the same entry as `"a"` **and** as a message in the
+asker's inbox. Every past ask stays on the card — that trail is the decision history.
+
+### Environment
+
+| Variable | Default | What it does |
+|---|---|---|
+| `FLOOR` | `1` | `0` disables the whole floor layer — memory files only |
+| `MAIL_NUDGE` | `1` | `0` stops waking idle agents about mail; they find it next turn |
+| `FLOOR_HOOKS` | `1` | `0` disables the hook plane; the idle-gate still works |
+| `FLOOR_INJECT` | `1` | `0` stops mail riding along on `SessionStart` / `UserPromptSubmit` |
+| `FLOOR_STATUSLINE` | `1` | `0` leaves the human's own status line alone |
+| `FLOOR_BREAKER` | `1` | `0` keeps telemetry but never steers, constrains, or denies |
+| `FLOOR_HOP_CAP` | `12` | replies before a thread is dropped |
+| `FLOOR_REPEAT_STEER/_CONSTRAIN/_STOP` | `8` / `14` / `20` | identical tool calls in a row per rung |
+| `FLOOR_ERROR_STEER/_CONSTRAIN` | `6` / `12` | consecutive failing tool calls per rung |
+| `FLOOR_USD_STEER/_CONSTRAIN` | `0` / `0` | per-session spend caps; `0` disables the rung |
+| `ROUTER_SWEEP_MS` | `2000` | outbox sweep interval (`fs.watch` is the fast path) |
+| `FLEET_WRITE_MS` | `5000` | how often `fleet.json` is rewritten |
+
+`node test/floor.js` (`npm test`) exercises all of it, including the hook plane over a
+real socket. It **wipes `data/floor/`**, so it refuses to run while a server is up:
+the server claims `data/.floor.pid` at boot (deliberately outside the wiped tree) and
+the test checks that pid is alive. `FLOOR_TEST_FORCE=1` overrides, and will cost you
+the agents' inboxes, their private `memory.md` files, and the ledger.
 
 ## Persistence — nothing starts over
 
@@ -257,6 +356,12 @@ its session, so a recreated agent starts a fresh chat. Floor layout persists in
 
 ## Architecture
 
+- `lib/floor.js` — floor paths, atomic write, the append-only event feed
+- `lib/mailbox.js` — the router: addressing, the four loop guards, `PROTOCOL.md`
+- `lib/ledger.js` — `tasks.json`, the kanban and the `humanQA` trail
+- `lib/fleet.js` — hook telemetry, `fleet.json`, the circuit breaker
+- `lib/hooks.js` — the unix-socket hook server and the per-agent `settings.json`
+- `bin/floor-hook.cjs` — the shim Claude Code runs on every lifecycle event
 - `server.js` — custom Next server + `ws` WebSocket bridge at `/pty` + `node-pty` session
   registry (`GET /api/sessions` reports live statuses for the desk lights)
 - `lib/skills.js` — office → project folder → `.claude/skills` resolution, skill read/write,
