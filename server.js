@@ -21,6 +21,11 @@ const { seedOfficeSkills } = require('./lib/seed-skills.js');
 const { loadEnv } = require('./lib/env.js');
 const { hasTracker, fetchOfficeTickets } = require('./lib/trackers/index.js');
 const { readTickets, writeTickets, newTodo, announceTickets } = require('./lib/tickets.js');
+const floor = require('./lib/floor.js');
+const mailbox = require('./lib/mailbox.js');
+const ledger = require('./lib/ledger.js');
+const fleet = require('./lib/fleet.js');
+const hooks = require('./lib/hooks.js');
 
 // Tracker credentials live in .env.local; read them before anything else.
 loadEnv();
@@ -35,8 +40,27 @@ const AUTOSTART = process.env.AUTOSTART !== '0';
 const AUTOSTART_STAGGER_MS = parseInt(process.env.AUTOSTART_STAGGER_MS || '600', 10);
 // How often each office's tracker board is pulled. TRACKER_POLL=0 disables it.
 const TRACKER_POLL_MS = parseInt(process.env.TRACKER_POLL_MS || '210000', 10); // 3.5 min
-// Whether a poll that finds new tickets may type a nudge into the lead's terminal.
-const TRACKER_NUDGE = process.env.TRACKER_NUDGE !== '0';
+// Whether an agent holding unread mail may be woken through its terminal.
+// Tracker tickets deliberately do NOT nudge: they become cards on the ledger and
+// the lead picks them up in its own time. Typing every new ticket into the lead's
+// terminal made it triage junk on sight and block the board with questions.
+const MAIL_NUDGE = process.env.MAIL_NUDGE !== '0';
+// How often a queued nudge retries while it waits for its agent to go idle.
+// Cheap: reads the mailbox, never calls the tracker.
+const NUDGE_DRAIN_MS = parseInt(process.env.NUDGE_DRAIN_MS || '20000', 10);
+// Gap between typing the nudge and pressing Enter, so the TUI registers the
+// text as input rather than swallowing the Enter into a paste.
+const NUDGE_SUBMIT_DELAY_MS = parseInt(process.env.NUDGE_SUBMIT_DELAY_MS || '400', 10);
+// ---- the floor layer: mailbox, ledger, fleet, hooks ----
+// How often every outbox on the floor is swept. fs.watch gives us the fast path;
+// this is the backstop, because nested-create events are unreliable on macOS and
+// a missed message is a silently dropped instruction.
+const ROUTER_SWEEP_MS = parseInt(process.env.ROUTER_SWEEP_MS || '2000', 10);
+// How often `data/floor/fleet.json` is rewritten. It is the only situational
+// awareness a LEAD has without a UI, so it needs to be fresh, not cheap.
+const FLEET_WRITE_MS = parseInt(process.env.FLEET_WRITE_MS || '5000', 10);
+// Set FLOOR=0 to run the old memory-file-only floor with none of this.
+const FLOOR_ON = process.env.FLOOR !== '0';
 
 const app = next({ dev });
 const handle = app.getRequestHandler();
@@ -63,15 +87,25 @@ function ensureMemoryFile(scope, label) {
   return file;
 }
 
-function memoryPrompt(oid, aid, role, officeFile, floorFile, skillsDir, lead) {
-  const teamRule = lead
-    ? `- You are the LEAD of this office. Delegate work by appending: "- [TASK] <agent-id>: <clear task description>". ` +
-      `At the start of every turn, check office memory for new "[DONE]" entries from your workers; when the delegated work is reported done, ` +
-      `review the reports and append "- [SUMMARY] [${oid}/${aid}]: <what the team completed, results, what remains>", and give that summary to the human as well.`
-    : `- You are a WORKER (${role}). At the start of every turn, check office memory for "[TASK] ${aid}: ..." entries assigned to you and do them. ` +
-      `WHENEVER you finish a piece of work — assigned by the lead or by the human — you MUST report back to the lead by appending: ` +
-      `"- [DONE] [${oid}/${aid}] <task>: <what you did, files touched, result>". A task is NOT finished until its [DONE] entry is written. ` +
-      `The lead reads these reports and writes the team [SUMMARY].`;
+/*
+ * The system prompt every agent is spawned with.
+ *
+ * 🔒 PROMPT-CACHE INVARIANT — keep this string VOLATILE-FREE.
+ *
+ * It may interpolate only values that are stable for an agent's whole lifetime:
+ * its id, its office, its role, its directories. Do NOT add dates, counters,
+ * UUIDs, roster state, task counts, or anything derived from `Date.now()`. This
+ * text is the cached prefix of every turn the agent ever takes; a prefix that
+ * differs between two spawns re-primes the entire system prompt on every turn and
+ * quietly doubles what the floor costs to run.
+ *
+ * Volatile context belongs on the live channels — the inbox, `fleet.json`, the
+ * PTY — never baked in here.
+ *
+ * Also: no shell syntax. Every path is written the way the AGENT will read it,
+ * not the way a shell would expand it.
+ */
+function memoryPrompt(oid, aid, role, officeFile, floorFile, skillsDir, lead, agentDir, protocolFile, tasksFile) {
   // One office = one project = one directory; its .claude/skills is the office's
   // own playbook, discovered natively because the session runs in that directory.
   const skillRule = skillsDir
@@ -83,16 +117,75 @@ function memoryPrompt(oid, aid, role, officeFile, floorFile, skillsDir, lead) {
         `- Keep the skills current: when the team settles on a procedure worth repeating, write or update a skill there.`,
       ]
     : [];
+
+  // The mailbox is how work is DELIVERED. The office memory file stays what it
+  // has always been — the office's narrative record, and what the floor UI reads.
+  // Both, on purpose: a message is addressed and arrives; a bullet in a shared
+  // file is only found if someone thinks to look.
+  const mailbox = [
+    `MAILBOX PROTOCOL — follow it every task:`,
+    `1. At the START of a task, read ${agentDir}/memory.md (your private memory) and EVERY file in ${agentDir}/inbox `
+      + `(messages other agents sent you). After handling a message, move its file into ${agentDir}/inbox/.done/.`,
+    `2. To ask another agent for something, or to tell one something, write ONE message JSON into ${agentDir}/outbox/ `
+      + `(schema in ${protocolFile}). NEVER write into another agent's folder — the floor router delivers your outbox for you.`,
+    `3. Address it with "to": a bare agent id for your own office, "<office>/<agent-id>" across offices, "lead" for your `
+      + `office lead, "floor" to reach every lead, "human" to reach the human through your lead.`,
+    `4. Only "request", "query" and "propose" expect a reply. "inform" and "done" are TERMINAL — do not reply to them, `
+      + `or two agents will loop forever and spend all night doing it.`,
+    `5. Record durable facts, decisions, and context by appending to ${agentDir}/memory.md — that file is yours alone and `
+      + `it is what survives a compact.`,
+    `6. If a "Circuit breaker" message appears in your inbox, YOU are the runaway behaviour it caught. Stop repeating, `
+      + `summarise what you tried, and do exactly what it says.`,
+  ];
+
+  const shared = [
+    `SHARED MEMORY — the narrative record, alongside the mailbox:`,
+    `- ${officeFile} is this office's shared memory, and the board the human reads. ${floorFile} is the floor memory, `
+      + `shared across ALL offices — put there only what other OFFICES need.`,
+    `- Append short markdown bullets prefixed "[${oid}/${aid}]". Never rewrite or delete another agent's entries.`,
+    `- ${tasksFile} is the structured task ledger (todo / doing / blocked / done, with title, assignee, priority, deps). `
+      + `Keep the card you are working on reflected in its status. An "assignee" is never cleared — a done card must `
+      + `still say who did the work.`,
+  ];
+
+  const teamRule = lead
+    ? [
+        `YOU ARE THE LEAD of this office. You run it: decompose incoming work, delegate it, and personally own the calls `
+          + `that matter — decomposition, sign-off, conflicts, integration — not the grunt work.`,
+        `- Delegate by MESSAGE, not by hoping someone reads a file: write one message per slice into your outbox with `
+          + `"act": "request". Every dispatch is a 4-part contract:`,
+        `    (1) OBJECTIVE — the concrete goal; (2) OUTPUT — the deliverable and its format; (3) TOOLS — what to use or `
+          + `avoid, and which references to read instead of re-deriving; (4) BOUNDARIES — scope limits and the definition of done.`,
+        `  Pass REFERENCES — file paths, message ids, card ids — never pasted content.`,
+        `- Check who you already have before asking for anyone new. Route work to an agent already on the floor.`,
+        `- You are the sole scribe of ${officeFile}. Others propose changes to it; you write them.`,
+        `- Answer your workers fast. A blocked agent is your problem, not theirs.`,
+        `- When the work lands, append "- [SUMMARY] [${oid}/${aid}]: <what the team completed, results, what remains>" to `
+          + `office memory and give that summary to the human too.`,
+        `- When a card can only move with the HUMAN — a question only they can answer, or an action only they can take — `
+          + `set the card to "blocked" and append the ask to its "humanQA" array as { "q": "<markdown>", "askedAt": "<iso>" }. `
+          + `Write it SHORT: one bold sentence saying exactly what you need, backticks for paths and values, one bullet per `
+          + `option, about 700 characters maximum. An ask longer than that is a report, not a question. Then move on to `
+          + `other work — never sit idle waiting for the answer.`,
+      ].join('\n')
+    : [
+        `YOU ARE A WORKER (${role}).`,
+        `- Work comes to you as a message in your inbox. When you finish, reply to the lead with "act": "done" and a real `
+          + `summary — what you did, which files, the result, anything still open. Never a bare "done".`,
+        `- Also append "- [DONE] [${oid}/${aid}] <task>: <what you did, files touched, result>" to office memory, so the `
+          + `human's board shows it. A task is not finished until both exist.`,
+        `- Stuck, or the request is ambiguous? Message "lead" with "act": "query" and keep working on something else `
+          + `meanwhile. Do not idle waiting for a reply.`,
+      ].join('\n');
+
   return [
     `You are agent "${aid}" (role: ${role}) in office "${oid}" on a multi-office agent floor.`,
+    `Your private workspace is ${agentDir}. The full floor protocol is ${protocolFile} — read it when you need the detail.`,
     ...skillRule,
-    `SHARED MEMORY PROTOCOL — follow it every task:`,
-    `1. At the START of a task, read ${officeFile} (office memory, shared by all agents in this office) and ${floorFile} (floor memory, shared across ALL offices).`,
-    `2. Record durable facts, decisions, and context by APPENDING short markdown bullets to the office memory file. Use the floor memory file for anything other offices need to know.`,
-    `3. Never rewrite or delete other agents' entries; append only. Prefix entries with "[${oid}/${aid}]".`,
-    `TEAM PROTOCOL — the office memory file is also the team's task board:`,
+    ...mailbox,
+    ...shared,
     teamRule,
-    `4. At the END of a task, append what you learned so other agents benefit.`,
+    `At the END of a task, append what you learned to ${agentDir}/memory.md so future-you remembers it.`,
   ].join('\n');
 }
 
@@ -209,7 +302,7 @@ function spawnSession(key, cwd, cols, rows, role = 'agent') {
   // so each agent gets a clean top-level session.
   const env = { TERM: 'xterm-256color' };
   for (const [k, v] of Object.entries(process.env)) {
-    if (!/^(CLAUDE_?CODE|CLAUDE_SESSION|AGENT_|HIVE_)/i.test(k)) env[k] = v;
+    if (!/^(CLAUDE_?CODE|CLAUDE_SESSION|AGENT_|HIVE_|FLOOR_)/i.test(k)) env[k] = v;
   }
 
   // Shared memory wiring: office + floor memory files, injected via system prompt.
@@ -221,6 +314,33 @@ function spawnSession(key, cwd, cols, rows, role = 'agent') {
   env.HARNESS_ROLE = role;
   env.OFFICE_MEMORY = officeFile;
   env.FLOOR_MEMORY = floorFile;
+
+  // Lead-ness comes from the agent record (role *or* name), so an agent named
+  // "REH LEAD" that was left at the default `agent` role still leads its office.
+  const agent = (findOffice(oid)?.agents || []).find((a) => a.id === aid) || { id: aid, role };
+
+  // Floor wiring: the mailbox has to exist before the agent that owns it does,
+  // or its first outbox write lands in a directory the router never scans.
+  let agentDirPath = '';
+  let settingsFile = '';
+  if (FLOOR_ON) {
+    agentDirPath = mailbox.ensureAgentDirs(key);
+    env.AGENT_KEY = key; // `office/agent` — how the hook plane identifies this session
+    env.AGENT_ID = aid;
+    env.AGENT_NAME = agent?.name || aid;
+    env.AGENT_OFFICE = oid;
+    env.AGENT_DIR = agentDirPath;
+    env.FLOOR_ROOT = floor.FLOOR_ROOT;
+    env.FLOOR_PROTOCOL = floor.PROTOCOL_FILE;
+    env.FLOOR_TASKS = floor.TASKS_FILE;
+    if (hooks.HOOKS_ON) env.FLOOR_SOCK = floor.SOCK_FILE;
+    try {
+      settingsFile = hooks.writeAgentSettings(key);
+    } catch (err) {
+      // No settings file means no telemetry for this agent. It still works.
+      console.error(`>   floor: could not write settings for ${key}: ${err.message}`);
+    }
+  }
 
   // Office skills: one office = one project, and that project's `.claude/skills`
   // is where Claude Code already looks — so seeding the role-aware starters here
@@ -237,9 +357,6 @@ function spawnSession(key, cwd, cols, rows, role = 'agent') {
     env.OFFICE_SKILLS = skills.dir;
     env.OFFICE_PROJECT = skills.cwd;
   }
-  // Lead-ness comes from the agent record (role *or* name), so an agent named
-  // "REH LEAD" that was left at the default `agent` role still leads its office.
-  const agent = (findOffice(oid)?.agents || []).find((a) => a.id === aid) || { id: aid, role };
   env.HARNESS_MEMORY_PROMPT = memoryPrompt(
     oid,
     aid,
@@ -248,15 +365,25 @@ function spawnSession(key, cwd, cols, rows, role = 'agent') {
     floorFile,
     skills.configured ? skills.dir : '',
     isLead(agent),
+    agentDirPath,
+    floor.PROTOCOL_FILE,
+    floor.TASKS_FILE,
   );
   // Only decorate the default `claude` command; a custom CLAUDE_CMD is run as-is.
   // Each agent has a stable session UUID: first spawn claims it with --session-id,
   // every later spawn (after kill, server restart, reboot) resumes the same chat.
   const sid = agentSessionId(key);
   const sessionFlag = transcriptExists(sid) ? `--resume ${sid}` : `--session-id ${sid}`;
+  // `--add-dir` has to cover the floor root as well as the memory files, or the
+  // agent can read the protocol it was just told to follow but not write the
+  // outbox message that protocol is entirely about.
+  const extraDirs = FLOOR_ON ? ` --add-dir "${floor.FLOOR_ROOT}"` : '';
+  // `--settings` MERGES on top of the user's own settings; it does not replace
+  // them. That file is generated per agent and carries the lifecycle hooks.
+  const settingsFlag = settingsFile ? ` --settings "${settingsFile}"` : '';
   const cmd =
     CLAUDE_CMD === 'claude'
-      ? `claude ${sessionFlag} --append-system-prompt "$HARNESS_MEMORY_PROMPT" --add-dir "${MEMORY_DIR}"`
+      ? `claude ${sessionFlag} --append-system-prompt "$HARNESS_MEMORY_PROMPT" --add-dir "${MEMORY_DIR}"${extraDirs}${settingsFlag}`
       : CLAUDE_CMD;
 
   const p = pty.spawn(shell, ['-il', '-c', cmd], {
@@ -367,7 +494,19 @@ function watchFloorState() {
     fs.watch(path.dirname(STATE_FILE), (_event, filename) => {
       if (filename && filename !== path.basename(STATE_FILE)) return;
       clearTimeout(timer);
-      timer = setTimeout(() => startAllSessions('floor changed'), 1500);
+      timer = setTimeout(() => {
+        // The roster changed, so the protocol handed to agents and the set of
+        // mailboxes both have to change with it — before any new terminal boots.
+        if (FLOOR_ON) {
+          try {
+            mailbox.writeProtocol();
+            for (const { key } of mailbox.roster()) mailbox.ensureAgentDirs(key);
+          } catch (err) {
+            console.error(`> floor: could not refresh the roster: ${err.message}`);
+          }
+        }
+        startAllSessions('floor changed');
+      }, 1500);
     });
   } catch (err) {
     console.error(`> autostart: cannot watch ${STATE_FILE}: ${err.message}`);
@@ -376,38 +515,70 @@ function watchFloorState() {
 
 // ---- tracker poll: pull each office's board, put new work in front of its lead ----
 
-/** The live session for an office's lead, if it has one and it is idle. */
-function idleLeadSession(office) {
-  const lead = (office.agents || []).find(isLead);
-  if (!lead) return null;
-  const key = `${office.id}/${lead.id}`;
+/**
+ * The live session for an agent, if it exists and it is idle.
+ *
+ * Only ever interrupt an idle agent. Mid-task or mid-prompt, the caller leaves
+ * the work queued and the drain below retries — which is the difference between
+ * a dropped nudge and a deferred one. This `!== 'done'` gate is the single reason
+ * typing into a live TUI is safe, and it is also the conclusion upstream reached
+ * the hard way after removing their forced-continuation Stop hook.
+ */
+function idleAgentSession(key) {
   const s = sessions.get(key);
   if (!s || s.dead) return null;
-  // Only ever interrupt an idle agent. Mid-task or mid-prompt, the nudge waits
-  // for the next poll rather than stepping on whatever is on screen.
   if (agentState(key, s) !== 'done') return null;
-  return { key, session: s, lead };
+  return s;
 }
 
-function nudgeLead(office, tickets) {
-  if (!TRACKER_NUDGE) return false;
-  const found = idleLeadSession(office);
-  if (!found) return false;
-  const list = tickets.slice(0, 8).map((t) => `${t.key} ${t.title}`).join('; ');
-  const more = tickets.length > 8 ? ` (+${tickets.length - 8} more)` : '';
-  const prompt =
-    `${tickets.length} new ticket(s) landed on the office board from the tracker: ${list}${more}. ` +
-    `Use your triage-backlog skill: read the [TICKET] rows in the office memory, decide which to take now, ` +
-    `and assign each one with a [TASK] line naming the dev and the ticket key.`;
+/**
+ * Type a prompt into an idle agent's terminal and submit it.
+ *
+ * Two writes, not one. Claude Code's input treats a large chunk as a paste, so a
+ * \r inside the same write lands as a newline in the composer instead of
+ * submitting — the prompt just sits there. Sending Enter separately, once the TUI
+ * has processed the text, is what actually submits it.
+ */
+function typeToAgent(key, session, prompt) {
   try {
-    // A PTY takes keystrokes; \r is the Enter that submits the prompt.
-    found.session.pty.write(`${prompt}\r`);
-    console.log(`> tracker: nudged ${found.key} with ${tickets.length} ticket(s)`);
+    session.pty.write(prompt);
+    setTimeout(() => {
+      try {
+        session.pty.write('\r');
+      } catch (err) {
+        console.error(`> nudge: could not submit to ${key}: ${err.message}`);
+      }
+    }, NUDGE_SUBMIT_DELAY_MS);
     return true;
   } catch (err) {
-    console.error(`> tracker: could not nudge ${found.key}: ${err.message}`);
+    console.error(`> nudge: could not type to ${key}: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * Wake an idle agent that has unread mail.
+ *
+ * The ids in the text are DIAGNOSTIC, not a work list. They let the agent tell "I
+ * already did this one" from "I was woken for nothing" without burning a
+ * round-trip, which is why the wording insists the inbox directory is what counts.
+ */
+function nudgeMail(key, messages) {
+  if (!FLOOR_ON || !MAIL_NUDGE) return false;
+  const session = idleAgentSession(key);
+  if (!session) return false; // still queued; the drain retries
+  const ids = messages.slice(0, 6).map((m) => m.id).join(', ');
+  const more = messages.length > 6 ? ` (+${messages.length - 6} more)` : '';
+  const prompt =
+    `You have ${messages.length} new floor inbox message(s) — at least: ${ids}${more}. ` +
+    `Read your inbox, act on what is pending there, and move handled ones to inbox/.done/. ` +
+    `Your inbox directory is authoritative: work everything still pending in it, and if a named id is already in ` +
+    `inbox/.done/ you handled it on an earlier turn and can ignore that one. ` +
+    `Act autonomously; only message your lead if you genuinely need a decision.`;
+  if (!typeToAgent(key, session, prompt)) return false;
+  mailbox.markNudged(key, messages.map((m) => m.id));
+  console.log(`> floor: woke ${key} with ${messages.length} message(s)`);
+  return true;
 }
 
 let polling = false;
@@ -430,14 +601,51 @@ async function pollTrackers(reason) {
       writeTickets(office.id, { provider, tickets, error: null, fetchedAt: new Date().toISOString() });
 
       const fresh = newTodo(prev, tickets);
-      if (!fresh.length) continue;
       const written = announceTickets(office.id, fresh);
-      if (!written.length) continue;
-      console.log(`> tracker (${office.id}): ${written.length} new ticket(s) on the board [${reason}]`);
-      nudgeLead(office, written);
+      // The same tickets, as structured cards.
+      //
+      // Built from EVERY todo ticket, not just the ones that appeared since the
+      // last poll. `fresh` is a diff against the cached board, so on a floor that
+      // has been running a while it is empty — and an office's existing backlog
+      // would never become cards at all, leaving the ledger dead on arrival.
+      // `taskFromTicket` is idempotent on the ticket key and returns the existing
+      // card untouched, so a poll can never drag a card the lead already moved
+      // back to `todo`.
+      if (FLOOR_ON) {
+        for (const t of tickets.filter((x) => x.todo)) {
+          try {
+            ledger.taskFromTicket(office.id, { ...t, provider });
+          } catch (err) {
+            console.error(`> floor: could not add card for ${t.key}: ${err.message}`);
+          }
+        }
+      }
+      if (written.length) {
+        console.log(`> tracker (${office.id}): ${written.length} new ticket(s) on the board [${reason}]`);
+      }
+
     }
   } finally {
     polling = false;
+  }
+}
+
+/**
+ * Wake any agent holding mail it has not been told about, as soon as it is idle.
+ *
+ * Runs far more often than the tracker poll and touches no network — it only
+ * re-reads the mailboxes. That is what turns "the agent was busy" from a dropped
+ * nudge into a queued one.
+ *
+ * Tracker tickets are NOT delivered this way. They land on the ledger as cards
+ * and on the office board as `[TICKET]` rows, and the lead picks them up when it
+ * next looks. Nothing from a tracker types into a terminal.
+ */
+function drainMailNudges() {
+  if (!FLOOR_ON || !MAIL_NUDGE) return;
+  for (const { key } of mailbox.roster()) {
+    const waiting = mailbox.unnudged(key);
+    if (waiting.length) nudgeMail(key, waiting);
   }
 }
 
@@ -447,10 +655,139 @@ function startTrackerPolling() {
     return;
   }
   const mins = (TRACKER_POLL_MS / 60000).toFixed(1);
-  console.log(`> tracker polling every ${mins} min${TRACKER_NUDGE ? '' : ' (lead nudge off)'}`);
+  console.log(`> tracker polling every ${mins} min (tickets become cards; no terminal nudge)`);
   // Let the floor finish booting before the first pull.
   setTimeout(() => pollTrackers('boot'), 15000);
   setInterval(() => pollTrackers('interval'), TRACKER_POLL_MS);
+}
+
+// ---- the floor: router sweep, fleet snapshot, hook plane -------------------
+
+/**
+ * Every agent on the floor, decorated with what the server knows right now.
+ * This is what `fleet.json` is built from — and `fleet.json` is how a LEAD gets
+ * situational awareness without a UI, so it has to cover agents whose terminal
+ * has never started, not just live ones.
+ */
+function floorRows() {
+  return mailbox.roster().map(({ key, office, agent, lead }) => ({
+    key,
+    office: office.id,
+    agent: agent.id,
+    name: agent.name || agent.id,
+    lead,
+    cwd: resolveCwd(office.cwd),
+    status: agentState(key, sessions.get(key)),
+    inboxBacklog: mailbox.pendingInbox(key).length,
+  }));
+}
+
+/**
+ * Which agent fired this hook.
+ *
+ * `AGENT_KEY` is injected at spawn and comes back on every payload, but it is
+ * checked against the live roster before we trust it — a stale terminal from a
+ * renamed office would otherwise write telemetry under a key that no longer
+ * exists and quietly accumulate a ghost agent in `fleet.json`.
+ */
+function resolveHookKey(payload) {
+  const claimed = payload.agent_key;
+  if (!claimed) return null;
+  return mailbox.roster().some((r) => r.key === claimed) ? claimed : null;
+}
+
+let sweeping = false;
+function sweepOutboxes(reason) {
+  if (sweeping) return;
+  sweeping = true;
+  try {
+    const n = mailbox.drainOutboxes();
+    if (n) console.log(`> floor: routed ${n} message(s) [${reason}]`);
+  } catch (err) {
+    console.error(`> floor: router sweep failed: ${err.message}`);
+  } finally {
+    sweeping = false;
+  }
+}
+
+function startFloor() {
+  if (!FLOOR_ON) {
+    console.log('> floor layer disabled (FLOOR=0) — office memory files only');
+    return;
+  }
+  fs.mkdirSync(floor.AGENTS_DIR, { recursive: true });
+  // Claim the floor. `test/floor.js` wipes data/floor/, so it needs to know a
+  // server is live before it does — and it cannot learn that from anything the
+  // wipe would remove.
+  try {
+    fs.writeFileSync(floor.PID_FILE, String(process.pid));
+    const release = () => {
+      try {
+        if (fs.readFileSync(floor.PID_FILE, 'utf8').trim() === String(process.pid)) fs.unlinkSync(floor.PID_FILE);
+      } catch {}
+    };
+    process.on('exit', release);
+    for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
+  } catch (err) {
+    console.error(`> floor: could not claim ${path.basename(floor.PID_FILE)}: ${err.message}`);
+  }
+  // Regenerated every boot so it always matches the live roster. Agents are
+  // pointed at it from their system prompt, and a protocol that describes an
+  // office that no longer exists is worse than no protocol at all.
+  try {
+    mailbox.writeProtocol();
+  } catch (err) {
+    console.error(`> floor: could not write PROTOCOL.md: ${err.message}`);
+  }
+  // Mailboxes for everyone on the roster, not just whoever has a terminal up:
+  // a lead must be able to dispatch to an agent that has not booted yet.
+  for (const { key } of mailbox.roster()) {
+    try {
+      mailbox.ensureAgentDirs(key);
+    } catch (err) {
+      console.error(`> floor: could not create mailbox for ${key}: ${err.message}`);
+    }
+  }
+
+  if (hooks.HOOKS_ON) hooks.startHookServer(resolveHookKey);
+  else console.log('> floor hooks disabled (FLOOR_HOOKS=0) — idle-gate telemetry only');
+
+  // fs.watch is the fast path; the interval is the backstop. Nested creates are
+  // unreliable on macOS — we already learned that watching data/state.json — and
+  // a message the router never notices is a silently dropped instruction.
+  sweepOutboxes('boot');
+  setInterval(() => sweepOutboxes('sweep'), ROUTER_SWEEP_MS);
+  try {
+    let timer = null;
+    fs.watch(floor.AGENTS_DIR, { recursive: true }, (_event, filename) => {
+      if (!filename || !filename.includes('outbox')) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => sweepOutboxes('watch'), 150);
+    });
+  } catch (err) {
+    console.error(`> floor: cannot watch mailboxes (${err.message}); falling back to the ${ROUTER_SWEEP_MS}ms sweep`);
+  }
+
+  const writeFleet = () => {
+    try {
+      fleet.writeFleet(floorRows());
+    } catch (err) {
+      console.error(`> floor: fleet snapshot failed: ${err.message}`);
+    }
+  };
+  writeFleet();
+  setInterval(writeFleet, FLEET_WRITE_MS);
+
+  if (MAIL_NUDGE && NUDGE_DRAIN_MS > 0) {
+    console.log(`> floor: queued mail nudges retry every ${Math.round(NUDGE_DRAIN_MS / 1000)}s until the agent is free`);
+    setInterval(drainMailNudges, NUDGE_DRAIN_MS);
+  } else {
+    console.log('> floor: mail nudges off (MAIL_NUDGE=0) — agents find mail on their next turn');
+  }
+  console.log(
+    `> floor: mailbox at ${path.relative(process.cwd(), floor.FLOOR_ROOT)} ` +
+      `(router every ${ROUTER_SWEEP_MS}ms, fleet every ${FLEET_WRITE_MS}ms, breaker ${fleet.BREAKER_ON ? 'on' : 'off'})`,
+  );
 }
 
 function sessionStatus() {
@@ -468,6 +805,22 @@ app.prepare().then(() => {
       res.end(JSON.stringify(sessionStatus()));
       return;
     }
+    // The breaker's counters live in this process, not on disk, so clearing one
+    // has to happen here rather than in a Next route (which gets its own module
+    // instance). Everything else the UI needs is read from data/floor/.
+    if (req.url.startsWith('/api/floor/reset-breaker')) {
+      const key = new URL(req.url, 'http://localhost').searchParams.get('key');
+      const r = key ? fleet.resetBreaker(key) : null;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: Boolean(r), breaker: r?.breaker || null }));
+      return;
+    }
+    if (req.url.startsWith('/api/floor/sweep')) {
+      sweepOutboxes('requested');
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
     if (req.url.startsWith('/api/start-all')) {
       startAllSessions('requested');
       res.setHeader('content-type', 'application/json');
@@ -480,7 +833,10 @@ app.prepare().then(() => {
       const s = key && sessions.get(key);
       if (s && !s.dead) s.pty.kill();
       if (key) sessions.delete(key);
-      if (key && params.get('forget')) forgetAgentSession(key);
+      if (key && params.get('forget')) {
+        forgetAgentSession(key);
+        fleet.forget(key); // its counters describe a session that no longer exists
+      }
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -567,6 +923,7 @@ app.prepare().then(() => {
 
   server.listen(port, () => {
     console.log(`> Harness Floor on http://localhost:${port} (claude cmd: ${CLAUDE_CMD})`);
+    startFloor();
     startTrackerPolling();
     if (AUTOSTART) {
       startAllSessions('boot');

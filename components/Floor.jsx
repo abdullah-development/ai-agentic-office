@@ -288,6 +288,9 @@ export default function Floor() {
   const [pickerErr, setPickerErr] = useState('');
   const [pickerBusy, setPickerBusy] = useState(false);
   const [tasks, setTasks] = useState([]); // parsed [TASK]/[DONE]/[SUMMARY] across the floor
+  // The floor layer: data/floor/fleet.json + tasks.json + the open ASK ME cards.
+  const [floorState, setFloorState] = useState({ fleet: { agents: [] }, tasks: [], asks: [], counts: {} });
+  const [askDraft, setAskDraft] = useState({}); // taskId -> the human's answer, mid-typing
   const [tickets, setTickets] = useState({ offices: [], todo: 0 }); // tracker backlog
   // per-office tracker config, edited in the office form
   const [trkProvider, setTrkProvider] = useState('');
@@ -474,6 +477,20 @@ export default function Floor() {
         .catch(() => {});
     tick();
     const iv = setInterval(tick, 4000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // The floor: telemetry the agents' own lifecycle hooks reported, the structured
+  // ledger, and anything blocked on the human. Everything here is read from
+  // data/floor/ — the server writes it, and agents read the same files.
+  useEffect(() => {
+    const tick = () =>
+      fetch('/api/floor')
+        .then((r) => r.json())
+        .then((d) => setFloorState(d))
+        .catch(() => {});
+    tick();
+    const iv = setInterval(tick, 3000);
     return () => clearInterval(iv);
   }, []);
 
@@ -902,6 +919,42 @@ export default function Floor() {
     .slice(0, 10);
   const trackerError = tickets.offices.find((o) => o.error)?.error || null;
   const unassigned = tasks.filter((t) => t.kind === 'task' && !liveAgents.some((l) => l.office.id === t.office && l.agent.id === t.agent));
+
+  // ---- floor layer: gauges, asks, ledger --------------------------------
+  const fleetRows = floorState.fleet?.agents || [];
+  // Anything wrong first: a tripped breaker, then a backlog nobody has read.
+  const fleetSorted = [...fleetRows].sort(
+    (a, b) =>
+      (a.breaker === 'healthy' ? 1 : 0) - (b.breaker === 'healthy' ? 1 : 0) ||
+      (b.inboxBacklog || 0) - (a.inboxBacklog || 0) ||
+      (b.ctxPct || 0) - (a.ctxPct || 0),
+  );
+  const openAsks = floorState.asks || [];
+  const ledger = floorState.tasks || [];
+  const ledgerCounts = floorState.counts || {};
+  const trippedCount = fleetRows.filter((a) => a.breaker && a.breaker !== 'healthy').length;
+  const mailBacklog = fleetRows.reduce((n, a) => n + (a.inboxBacklog || 0), 0);
+
+  const sendAnswer = (taskId) => {
+    const answer = (askDraft[taskId] || '').trim();
+    if (!answer) return;
+    fetch('/api/floor', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'answer', id: taskId, answer }),
+    })
+      .then(() => {
+        setAskDraft((d) => ({ ...d, [taskId]: '' }));
+        return fetch('/api/floor').then((r) => r.json()).then(setFloorState);
+      })
+      .catch(() => {});
+  };
+
+  const clearBreaker = (key) => {
+    fetch(`/api/floor/reset-breaker?key=${encodeURIComponent(key)}`)
+      .then(() => fetch('/api/floor').then((r) => r.json()).then(setFloorState))
+      .catch(() => {});
+  };
   const runningCount = liveAgents.filter((l) => l.st === 'working' || l.st === 'starting').length;
 
   const memEntries = memContent
@@ -2798,6 +2851,227 @@ export default function Floor() {
           </div>
 
           <div style={{ flex: 1, minHeight: 0, overflowY: 'auto' }}>
+            {/* ASK ME — cards blocked on the human. Always the top of the rail:
+                nothing else here can move until one of these is answered. */}
+            {openAsks.length > 0 && (
+              <div style={{ borderBottom: '2px solid #1F1F23', background: '#12060A' }}>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#ED1B2E',
+                    padding: '10px 13px 6px',
+                  }}
+                >
+                  ask me · {openAsks.length}
+                </div>
+                {openAsks.map((a) => (
+                  <div key={`${a.taskId}-${a.askedAt}`} style={{ padding: '0 13px 11px' }}>
+                    <div style={{ ...mono, fontSize: 9, color: '#5A5A62', marginBottom: 3 }}>
+                      {a.askedBy || a.assignee || a.office} · {a.title}
+                    </div>
+                    {/* The ask is markdown by contract, but a rail is not a
+                        renderer — show it as written, wrapped, and keep it short
+                        by asking the agents to write it short. */}
+                    <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.6, color: '#F5F0E6', whiteSpace: 'pre-wrap' }}>
+                      {a.q}
+                    </div>
+                    <textarea
+                      value={askDraft[a.taskId] || ''}
+                      onChange={(e) => setAskDraft((d) => ({ ...d, [a.taskId]: e.target.value }))}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) sendAnswer(a.taskId);
+                      }}
+                      placeholder="your answer — ⌘⏎ to send"
+                      rows={2}
+                      style={{
+                        ...mono,
+                        fontSize: 10.5,
+                        width: '100%',
+                        marginTop: 6,
+                        padding: '6px 8px',
+                        background: '#08080A',
+                        color: '#F5F0E6',
+                        border: '2px solid #2A2A2E',
+                        borderRadius: 6,
+                        resize: 'vertical',
+                      }}
+                    />
+                    <div
+                      className="hf-btn"
+                      onClick={() => sendAnswer(a.taskId)}
+                      style={{
+                        ...archivo,
+                        fontWeight: 700,
+                        fontSize: 9,
+                        letterSpacing: '.14em',
+                        textTransform: 'uppercase',
+                        marginTop: 5,
+                        padding: '5px 10px',
+                        display: 'inline-block',
+                        border: '2px solid #ED1B2E',
+                        borderRadius: 6,
+                        color: '#ED1B2E',
+                        cursor: 'pointer',
+                        opacity: (askDraft[a.taskId] || '').trim() ? 1 : 0.4,
+                      }}
+                    >
+                      answer
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* FLEET — what the agents' own lifecycle hooks reported. Context and
+                cost come from the session's real numbers, not from scraping the
+                terminal, so they are exact. */}
+            {fleetSorted.length > 0 && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '10px 13px 6px',
+                  }}
+                >
+                  fleet
+                  {mailBacklog > 0 && <span style={{ color: '#FFC83D' }}> · {mailBacklog} unread</span>}
+                  {trippedCount > 0 && <span style={{ color: '#ED1B2E' }}> · {trippedCount} tripped</span>}
+                </div>
+                {fleetSorted.map((a) => (
+                  <div
+                    key={a.key}
+                    className="hf-btn"
+                    onClick={(e) => openAgent(a.office, a.agent, e)}
+                    style={{ padding: '7px 13px', cursor: 'pointer', borderBottom: '1px solid #131317' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span
+                        style={{
+                          width: 7,
+                          height: 7,
+                          borderRadius: '50%',
+                          flexShrink: 0,
+                          background: statusColor(a.status),
+                        }}
+                      />
+                      <span style={{ ...archivo, fontWeight: 700, fontSize: 10, letterSpacing: '.06em' }}>
+                        {a.name}
+                        {a.lead && <span style={{ color: '#FFC83D' }}> ·lead</span>}
+                      </span>
+                      <span style={{ flex: 1 }} />
+                      {a.inboxBacklog > 0 && (
+                        <span style={{ ...mono, fontSize: 9, color: '#FFC83D' }}>✉ {a.inboxBacklog}</span>
+                      )}
+                      {a.usd > 0 && <span style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>${a.usd.toFixed(2)}</span>}
+                    </div>
+                    {/* Context gauge: the exact window size arrives with the
+                        status event, so this is the real percentage, not a guess
+                        from the model name. */}
+                    {a.ctxSize > 0 && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                        <div style={{ flex: 1, height: 3, background: '#1F1F23', borderRadius: 2, overflow: 'hidden' }}>
+                          <div
+                            style={{
+                              width: `${Math.min(100, a.ctxPct)}%`,
+                              height: '100%',
+                              background: a.ctxPct > 85 ? '#ED1B2E' : a.ctxPct > 60 ? '#FFC83D' : '#4E6A65',
+                            }}
+                          />
+                        </div>
+                        <span style={{ ...mono, fontSize: 8.5, color: '#5A5A62' }}>{a.ctxPct}%</span>
+                      </div>
+                    )}
+                    {a.lastTool && (
+                      <div style={{ ...mono, fontSize: 9, color: '#5A5A62', marginTop: 3 }}>
+                        {a.lastTool}
+                        {a.lastActiveSecAgo != null && ` · ${a.lastActiveSecAgo}s ago`}
+                      </div>
+                    )}
+                    {a.breaker && a.breaker !== 'healthy' && (
+                      <div
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          clearBreaker(a.key);
+                        }}
+                        style={{
+                          ...mono,
+                          fontSize: 9,
+                          lineHeight: 1.5,
+                          marginTop: 5,
+                          padding: '4px 7px',
+                          border: '1px solid #ED1B2E',
+                          borderRadius: 5,
+                          color: '#ED1B2E',
+                        }}
+                      >
+                        breaker: {a.breaker} — {a.breakerReason}
+                        <br />
+                        <span style={{ textDecoration: 'underline' }}>click to clear</span>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
+
+            {/* LEDGER — the structured board. The prose [TASK]/[DONE] rows below
+                are still the narrative; this is the part the server can reason about. */}
+            {ledger.length > 0 && (
+              <>
+                <div
+                  style={{
+                    ...archivo,
+                    fontWeight: 700,
+                    fontSize: 8.5,
+                    letterSpacing: '.18em',
+                    textTransform: 'uppercase',
+                    color: '#5A5A62',
+                    padding: '12px 13px 6px',
+                  }}
+                >
+                  ledger · {ledgerCounts.doing || 0} doing · {ledgerCounts.todo || 0} todo
+                  {ledgerCounts.blocked ? ` · ${ledgerCounts.blocked} blocked` : ''}
+                </div>
+                {ledger
+                  .filter((t) => t.status !== 'done')
+                  .slice(0, 12)
+                  .map((t) => (
+                    <div key={t.id} style={{ padding: '6px 13px' }}>
+                      <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
+                        <span
+                          style={{
+                            ...mono,
+                            fontSize: 8.5,
+                            textTransform: 'uppercase',
+                            color:
+                              t.status === 'blocked' ? '#ED1B2E' : t.status === 'doing' ? STATUS.working : '#5A5A62',
+                          }}
+                        >
+                          {t.status}
+                        </span>
+                        <span style={{ ...mono, fontSize: 10.5, lineHeight: 1.5, color: '#F5F0E6', flex: 1 }}>
+                          {t.title}
+                        </span>
+                      </div>
+                      {/* An assignee is never cleared by a status change — a done
+                          card must still say who did the work. */}
+                      {t.assignee && (
+                        <div style={{ ...mono, fontSize: 9, color: '#5A5A62' }}>{t.assignee}</div>
+                      )}
+                    </div>
+                  ))}
+              </>
+            )}
+
             {/* live agents, each with whatever the board has assigned to them */}
             <div
               style={{
